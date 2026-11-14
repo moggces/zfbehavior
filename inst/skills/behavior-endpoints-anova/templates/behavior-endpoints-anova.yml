@@ -1,0 +1,63 @@
+# Parameters for one behavior-endpoints-anova run.
+# Location: <project>/analysis/behavior-endpoints-anova/<run_label>/behavior-endpoints-anova.yml
+# Render:   quarto render behavior-endpoints-anova.qmd --execute-params behavior-endpoints-anova.yml
+#
+# Every value below is a scientific/study choice. Fill it in WITH the user;
+# never guess. Values marked REQUIRED have no default.
+
+# REQUIRED. Must equal this run folder's name (letters, digits, '-', '_').
+run_label: "CHANGE_ME"
+
+# Project root relative to this run folder.
+project_root: "../../.."
+
+# REQUIRED. Exactly one complete behavior-endpoints run folder (relative to
+# the project root), plus zero or more complete intraplate-vc-qc runs made on
+# that same endpoints run, whose `excluded_plates` are dropped.
+upstream:
+  - analysis/behavior-endpoints/CHANGE_ME
+
+# Movement-similarity metric(s) to test (each must exist in the endpoints
+# run): spearman (historical default) and/or pearson. Each metric is tested
+# and plotted separately (one plot column per metric); no metric pooling.
+similarity_metrics: [spearman]
+
+# Significance level for the omnibus tests and the Dunnett post-hoc tests.
+alpha: 0.05
+
+# RM-ANOVA over the distance-change segments (AR(1), per plate):
+#   auto  - run when there are >= 2 distance-change segments, else skip (noted)
+#   false - do not run
+rmanova: auto
+
+# Seed set before ANOVA and before RM-ANOVA (Dunnett p-values use Monte-Carlo
+# integration), so a re-render gives identical p-values.
+seed: 20260806
+
+# Activity plot: chemical label (facet rows) and plate label (y axis; the
+# tested unit), each = these import-data columns joined with "@".
+# Empty plate_label_cols = plate_id.
+chemical_label_cols: [CHEMICAL_NAME]
+plate_label_cols: [plate_id]
+
+# Results computed (hits.rds) but left out of the activity PDF, and why
+# (required when a list is not empty). [] = everything shown.
+#   activity_exclude_tests:     ANOVA and/or RMANOVA
+#   activity_exclude_endpoints: endpoint names, e.g. LD_pearson
+activity_exclude_tests: []
+activity_exclude_endpoints: []
+activity_exclude_reason: null
+
+# Plate rows per page (whole chemicals; every page padded to the same number
+# of plate rows, so a plate row has the same height on every page);
+# chemical order: alphabetical | as_given.
+n_per_page: 20
+order: alphabetical
+
+# Characters per line of the wrapped chemical labels.
+chemical_wrap_width: 50
+
+# PDF size in inches. If chemical labels do not fit their panels, the report
+# lists them: increase pdf_height (or chemical_wrap_width).
+pdf_width: 17
+pdf_height: 16

@@ -1,0 +1,543 @@
+---
+title: "behavior-endpoints"
+subtitle: "Behavioral endpoints (total distance, distance change, distance shift, movement similarity), normalized per plate, with dose-response plots"
+format:
+  html:
+    toc: true
+    code-fold: true
+    embed-resources: true
+execute:
+  warning: true
+  message: false
+params:
+  # All values come from behavior-endpoints.yml (--execute-params); defaults
+  # are null on purpose (nested-map defaults are not valid knitr params).
+  run_label: null
+  project_root: "../../.."
+  upstream: null
+  segments: null
+  similarity_segments: null
+  similarity_metrics: null
+  normalization: null
+  layout: null
+  chemical_col: null
+  title_cols: null
+  title_wrap_width: null
+  panel_order: null
+  ncol: null
+  pdf_width: null
+  pdf_height_per_row: null
+---
+
+<!--
+Template shipped with the zfbehavior package (inst/skills/behavior-endpoints/).
+Do not edit the analysis code below for a specific study -- put every
+study-specific choice in behavior-endpoints.yml and render with:
+
+  quarto render behavior-endpoints.qmd --execute-params behavior-endpoints.yml
+
+This document only calls exported zfbehavior functions. See
+inst/skills/CONVENTIONS.md for the run-folder / naming / manifest rules.
+-->
+
+```{r}
+#| label: setup
+#| include: false
+
+library(zfbehavior)
+
+p <- params
+skill <- "behavior-endpoints"
+
+stop_param <- function(msg) {
+  stop("behavior-endpoints parameter error: ", msg, call. = FALSE)
+}
+as_chr <- function(x) if (is.null(x)) character(0) else unlist(x, use.names = FALSE)
+or_default <- function(x, default) if (is.null(x) || length(x) == 0) default else x
+num <- function(x, default, what, lower = -Inf, integer = FALSE) {
+  v <- suppressWarnings(as.numeric(or_default(x, default)))
+  if (length(v) != 1 || !is.finite(v) || v < lower || (integer && v != round(v))) {
+    stop_param(paste0("`", what, "` must be ", if (integer) "an integer" else "a number",
+                      if (is.finite(lower)) paste0(" >= ", lower) else "", "."))
+  }
+  v
+}
+parse_segments <- function(x, what) {
+  if (is.null(x) || length(x) == 0) stop_param(paste0("`", what, "` is required (confirm with the user)."))
+  out <- lapply(names(x), function(nm) {
+    s <- x[[nm]]
+    if (!is.list(s) || is.null(s$from) || is.null(s$to)) {
+      stop_param(paste0(what, " `", nm, "` must be given as {from: <first>, to: <last>}."))
+    }
+    from <- as.numeric(s$from)
+    to <- as.numeric(s$to)
+    if (length(from) != 1 || length(to) != 1 || !is.finite(from) || !is.finite(to) || to < from) {
+      stop_param(paste0(what, " `", nm, "` needs numeric from <= to."))
+    }
+    seq(from, to)
+  })
+  names(out) <- names(x)
+  all_t <- unlist(out, use.names = FALSE)
+  if (anyDuplicated(all_t)) {
+    stop_param(paste0("`", what, "` overlap at time_value(s): ",
+                      paste(unique(all_t[duplicated(all_t)]), collapse = ", ")))
+  }
+  out
+}
+
+if (is.null(p$run_label) || !grepl("^[A-Za-z0-9_-]+$", p$run_label)) {
+  stop_param("`run_label` is required (letters, digits, '-', '_').")
+}
+upstream_runs <- sub("/+$", "", as_chr(p$upstream))
+if (length(upstream_runs) == 0) {
+  stop_param("`upstream` must list one dataset-import-qc run (plus optional QC runs).")
+}
+segments <- parse_segments(p$segments, "segments")
+similarity_segments <- parse_segments(p$similarity_segments, "similarity_segments")
+similarity_metrics <- or_default(as_chr(p$similarity_metrics), "spearman")
+bad_metric <- setdiff(similarity_metrics, c("spearman", "pearson", "cosine", "euclidean"))
+if (length(bad_metric) > 0) stop_param(paste0("unknown similarity metric(s): ", paste(bad_metric, collapse = ", ")))
+
+default_norm <- list(total_distance = "log_diff", distance_change_shift = "none", movement_similarity = "ratio")
+normalization <- if (is.null(p$normalization)) list() else as.list(p$normalization)
+bad_norm_type <- setdiff(names(normalization), names(default_norm))
+if (length(bad_norm_type) > 0) {
+  stop_param(paste0("unknown endpoint type(s) in `normalization`: ", paste(bad_norm_type, collapse = ", ")))
+}
+normalization <- lapply(normalization, as.character)
+norm_used <- utils::modifyList(default_norm, normalization)
+
+layout <- or_default(p$layout, "per_plate")
+if (!layout %in% c("per_plate", "by_chemical_pooled")) {
+  stop_param("`layout` must be per_plate or by_chemical_pooled.")
+}
+chemical_col <- or_default(as_chr(p$chemical_col), "DTXSID")
+title_cols <- as_chr(p$title_cols)
+title_wrap_width <- num(p$title_wrap_width, 40, "title_wrap_width", lower = 1)
+panel_order <- or_default(p$panel_order, "alphabetical")
+if (!panel_order %in% c("alphabetical", "group_key")) {
+  stop_param("`panel_order` must be alphabetical or group_key.")
+}
+n_col <- num(p$ncol, 4, "ncol", lower = 1, integer = TRUE)
+pdf_width <- num(p$pdf_width, 15, "pdf_width", lower = 1)
+pdf_height_per_row <- num(p$pdf_height_per_row, 2.2, "pdf_height_per_row", lower = 0.5)
+
+project_root <- normalizePath(p$project_root, mustWork = TRUE)
+out_dir <- "outputs"
+dir.create(out_dir, showWarnings = FALSE)
+out_path <- function(object, ext) {
+  file.path(out_dir, paste0(skill, "__", p$run_label, "__", object, ".", ext))
+}
+for (f in list.files(out_dir, pattern = paste0("^", skill, "__", p$run_label, "__"), full.names = TRUE)) {
+  file.remove(f)
+}
+# CONVENTIONS.md section 2: every table saved to outputs/ is a tibble,
+# including tables one level inside a saved list / result object.
+save_rds <- function(x, path) {
+  as_tbl <- function(v) if (is.data.frame(v) && !inherits(v, "tbl_df")) tibble::as_tibble(v) else v
+  x <- as_tbl(x)
+  if (is.list(x) && !is.data.frame(x)) {
+    cls <- class(x)
+    x[] <- lapply(x, as_tbl)
+    class(x) <- cls
+  }
+  saveRDS(x, path)
+}
+md5 <- function(f) unname(tools::md5sum(f))
+
+has_reactable <- requireNamespace("reactable", quietly = TRUE)
+show_table <- function(df, page_size = 15) {
+  if (has_reactable) {
+    reactable::reactable(df, filterable = TRUE, searchable = TRUE, sortable = TRUE,
+                         defaultPageSize = page_size, striped = TRUE, compact = TRUE)
+  } else {
+    knitr::kable(df, row.names = FALSE)
+  }
+}
+```
+
+## Run
+
+- Skill: `behavior-endpoints`
+- Run label: **`r p$run_label`**
+- Layout: **`r layout`**`r if (layout != "per_plate") paste0(" (chemical column: ", chemical_col, ")") else ""`
+- zfbehavior version: `r as.character(utils::packageVersion("zfbehavior"))`
+- Rendered: `r format(Sys.time(), "%Y-%m-%d %H:%M:%S")`
+
+## Upstream
+
+Exactly one `complete` `dataset-import-qc` run (single-larva wells only),
+plus optional `complete` QC runs of that same import whose `excluded_plates`
+are dropped (`CONVENTIONS.md`, section 6).
+
+```{r}
+#| label: upstream
+
+read_manifest <- function(run) {
+  dir <- file.path(project_root, run)
+  f <- list.files(file.path(dir, "outputs"), pattern = "__manifest\\.yml$", full.names = TRUE)
+  if (length(f) != 1) {
+    stop("behavior-endpoints: no unique manifest found in ", file.path(dir, "outputs"), call. = FALSE)
+  }
+  m <- yaml::read_yaml(f)
+  if (!identical(m$status, "complete")) {
+    stop("behavior-endpoints: upstream run `", run, "` has status `", m$status,
+         "`, not `complete`. Resolve it first (", m$status_reason, ").", call. = FALSE)
+  }
+  m$.run <- run
+  m$.manifest_file <- f
+  m
+}
+ups <- lapply(upstream_runs, read_manifest)
+up_skills <- vapply(ups, function(m) as.character(m$skill), "")
+if (sum(up_skills == "dataset-import-qc") != 1) {
+  stop_param("`upstream` must list exactly one dataset-import-qc run.")
+}
+imp <- ups[[which(up_skills == "dataset-import-qc")]]
+qc_runs <- ups[up_skills != "dataset-import-qc"]
+if (!identical(imp$well_contract, "single_larva_wells_only")) {
+  stop("behavior-endpoints: the import manifest does not declare `well_contract: ",
+       "single_larva_wells_only`. Re-run dataset-import-qc with the current skill.", call. = FALSE)
+}
+for (m in qc_runs) {
+  qc_up <- vapply(m$upstream, function(u) sub("/+$", "", as.character(u$run)), "")
+  if (!imp$.run %in% qc_up) {
+    stop("behavior-endpoints: QC run `", m$.run, "` (", m$skill, ") was made on ",
+         paste(qc_up, collapse = ", "), ", not on the import run `", imp$.run, "`.", call. = FALSE)
+  }
+}
+imp_outputs <- data.frame(
+  path = vapply(imp$outputs, `[[`, "", "path"),
+  md5 = vapply(imp$outputs, `[[`, "", "md5"),
+  stringsAsFactors = FALSE
+)
+combined_rel <- imp_outputs$path[grepl("__combined\\.rds$", imp_outputs$path)]
+if (length(combined_rel) != 1) {
+  stop("behavior-endpoints: import manifest lists no combined.rds output.", call. = FALSE)
+}
+combined_file <- file.path(project_root, imp$.run, combined_rel)
+md5_now <- md5(combined_file)
+md5_drift <- !identical(md5_now, imp_outputs$md5[imp_outputs$path == combined_rel])
+if (md5_drift) {
+  warning("Upstream combined.rds md5 differs from its manifest: the import run was ",
+          "modified after it completed. Confirm with the user before using these results.",
+          call. = FALSE)
+}
+
+knitr::kable(data.frame(
+  upstream = vapply(ups, `[[`, "", ".run"),
+  skill = up_skills,
+  status = vapply(ups, function(m) as.character(m$status), ""),
+  excluded_plates = vapply(ups, function(m) length(m$excluded_plates), 1L)
+), caption = paste0("Upstream runs. combined.rds md5 matches its manifest: ", !md5_drift, "."))
+```
+
+```{r}
+#| label: load
+
+combined <- readRDS(combined_file)
+qc_excl <- do.call(rbind, c(
+  list(data.frame(plate_id = character(0), reason = character(0), qc_run = character(0))),
+  lapply(qc_runs, function(m) {
+    if (length(m$excluded_plates) == 0) return(NULL)
+    data.frame(
+      plate_id = vapply(m$excluded_plates, function(e) as.character(e$plate_id), ""),
+      reason = vapply(m$excluded_plates, function(e) as.character(e$reason), ""),
+      qc_run = m$.run, stringsAsFactors = FALSE
+    )
+  })
+))
+unknown_excl <- setdiff(qc_excl$plate_id, combined$plate_id)
+if (length(unknown_excl) > 0) {
+  stop("behavior-endpoints: QC-excluded plate(s) not in the import data: ",
+       paste(unknown_excl, collapse = ", "), call. = FALSE)
+}
+d <- combined[!combined$plate_id %in% qc_excl$plate_id, , drop = FALSE]
+
+by_chem <- layout == "by_chemical_pooled"
+id_cols <- unique(c(if (by_chem) chemical_col, title_cols))
+id_cols <- setdiff(id_cols, c("plate_id", "well_id", "chemical_id", "concentration", "concentration_unit",
+                              "keep_well", "is_vehicle_control"))
+missing_cols <- setdiff(c(behavior_endpoint_input_cols(), "chemical_id", "concentration", id_cols, title_cols),
+                        names(d))
+if (length(missing_cols) > 0) {
+  stop_param(paste0("column(s) not in the upstream data: ", paste(missing_cols, collapse = ", ")))
+}
+na_cols <- id_cols[vapply(id_cols, function(cc) anyNA(d[[cc]]), TRUE)]
+if (length(na_cols) > 0) {
+  stop_param(paste0("column(s) with missing values cannot identify plates/chemicals: ",
+                    paste(na_cols, collapse = ", ")))
+}
+times <- sort(unique(d$time_value))
+for (what in c("segments", "similarity_segments")) {
+  st <- unlist(get(what), use.names = FALSE)
+  miss <- setdiff(st, times)
+  if (length(miss) > 0) {
+    stop_param(paste0(what, " time_value(s) not present in the data: ", paste(utils::head(miss, 10), collapse = ", ")))
+  }
+}
+
+# Endpoints use kept wells only, with missing distance values set to 0
+# (the same rule as raw-response-plots' impute_zero and the validated method).
+eligible <- d[d$keep_well, , drop = FALSE]
+endpoint_input <- replace_na_response_zero(eligible)
+
+knitr::kable(data.frame(
+  plates_in_import = length(unique(combined$plate_id)),
+  plates_excluded_by_qc = length(unique(qc_excl$plate_id)),
+  plates_used = length(unique(d$plate_id)),
+  kept_wells = nrow(unique(eligible[, c("plate_id", "well_id")])),
+  keep_well_false_wells_not_used = nrow(unique(d[!d$keep_well, c("plate_id", "well_id")])),
+  missing_values_set_to_0 = sum(is.na(eligible$response_value)),
+  timepoints = length(times)
+), caption = "Data used for endpoints (kept wells only).")
+if (nrow(qc_excl) > 0) knitr::kable(qc_excl, row.names = FALSE, caption = "Plates excluded by upstream QC runs.")
+```
+
+## Endpoints
+
+`generate_behavior_endpoints()` computes, per well, total distance (area
+under the movement curve per segment), distance change (`both`: area of
+|well - plate VC median trace|) and distance shift (`up` / `down`: area above
+/ below it) per segment, and movement similarity (mean correlation with the
+plate's VC wells) per similarity window. Each value is normalized per plate
+against the plate's vehicle-control median.
+
+```{r}
+#| label: settings
+
+seg_tbl <- data.frame(
+  window = c(paste0(names(segments), " (phase)"), paste0(names(similarity_segments), " (similarity)")),
+  from = c(vapply(segments, min, 1), vapply(similarity_segments, min, 1)),
+  to = c(vapply(segments, max, 1), vapply(similarity_segments, max, 1))
+)
+knitr::kable(seg_tbl, row.names = FALSE, caption = "Endpoint windows (time_value, inclusive).")
+norm_tbl <- data.frame(
+  endpoint_type = names(norm_used),
+  normalization = unlist(norm_used),
+  default = unlist(default_norm[names(norm_used)]),
+  is_default = unlist(norm_used) == unlist(default_norm[names(norm_used)])
+)
+knitr::kable(norm_tbl, row.names = FALSE, caption = paste0(
+  "Normalization per endpoint type; similarity metric(s): ", paste(similarity_metrics, collapse = ", "), "."
+))
+if (!all(norm_tbl$is_default)) {
+  cat("NOTE: non-default normalization for:", paste(norm_tbl$endpoint_type[!norm_tbl$is_default], collapse = ", "), "\n")
+}
+```
+
+```{r}
+#| label: generate
+
+cor_warnings <- character(0)
+endpoints <- withCallingHandlers(
+  generate_behavior_endpoints(
+    endpoint_input,
+    auc_segments = segments,
+    similarity_segments = similarity_segments,
+    similarity_metrics = similarity_metrics,
+    normalization = normalization,
+    extra_id_cols = id_cols
+  ),
+  warning = function(w) {
+    cor_warnings <<- c(cor_warnings, conditionMessage(w))
+    invokeRestart("muffleWarning")
+  }
+)
+validation <- validate_behavior_endpoints(
+  endpoints,
+  source_d = endpoint_input,
+  expected_endpoint_types = c("total_distance", "distance_change_shift", "movement_similarity")
+)
+
+knitr::kable(data.frame(
+  rows = nrow(endpoints),
+  wells = nrow(unique(endpoints[, c("plate_id", "well_id")])),
+  endpoints = length(unique(endpoints$endpoint)),
+  na_normalized = sum(is.na(endpoints$endpoint_value_norm)),
+  warnings_captured = length(cor_warnings)
+), caption = "Endpoint table.")
+if (length(cor_warnings) > 0) {
+  knitr::kable(as.data.frame(table(warning = cor_warnings), responseName = "n"),
+               caption = "Warnings during calculation (e.g. zero-variance wells in movement similarity; their similarity is set to 0).")
+}
+```
+
+```{r}
+#| label: tbl-validation
+
+knitr::kable(as.data.frame(validation$checks)[, c("code", "status", "message", "n_affected")], row.names = FALSE,
+             caption = paste0("Structural validation (validate_behavior_endpoints): ",
+                              if (isTRUE(validation$ok)) "passed" else "FAILED", "."))
+```
+
+```{r}
+#| label: tbl-inventory
+
+inv <- stats::aggregate(
+  endpoint_value_norm ~ endpoint_type + endpoint + normalization_method,
+  data = as.data.frame(endpoints[!endpoints$is_vehicle_control, ]),
+  FUN = function(v) round(stats::median(v), 2)
+)
+names(inv)[4] <- "median_normalized_treated"
+inv <- inv[order(match(inv$endpoint_type, c("total_distance", "distance_change_shift", "movement_similarity")),
+                 inv$endpoint), ]
+knitr::kable(inv, row.names = FALSE, caption = "Endpoints (median normalized value of treated wells).")
+```
+
+## Dose-response plots
+
+Four PDFs, one per endpoint group, normalized values; one panel per
+`r if (by_chem) "chemical (points coloured by plate)" else "plate"`, one row
+per endpoint (in segment order), `r n_col` panels per page, panels in
+`r panel_order` order. The vehicle control is the first box (`VC`).
+
+```{r}
+#| label: plots
+
+seg_names <- names(segments)
+sim_names <- as.vector(outer(names(similarity_segments), similarity_metrics, paste, sep = "_"))
+groups <- list(
+  `total-distance` = list(
+    rows = seg_names,
+    y = "total distance (normalized)"
+  ),
+  `distance-change` = list(
+    rows = paste0(seg_names, "@both_auc"),
+    y = "distance change (normalized)"
+  ),
+  `distance-shift` = list(
+    rows = as.vector(rbind(paste0(seg_names, "@down_auc"), paste0(seg_names, "@up_auc"))),
+    y = "distance shift (normalized)"
+  ),
+  `movement-similarity` = list(
+    rows = sim_names,
+    y = "movement similarity (normalized)"
+  )
+)
+
+plot_base <- as.data.frame(endpoints)
+key_col <- if (by_chem) chemical_col else "plate_id"
+tcols <- if (length(title_cols) > 0) title_cols else key_col
+plot_base$plot_title <- do.call(paste, c(lapply(tcols, function(cc) as.character(plot_base[[cc]])), sep = " | "))
+titles <- unique(plot_base[, c(key_col, "plot_title")])
+if (anyDuplicated(titles[[key_col]])) {
+  stop_param(paste0("`title_cols` must be constant within each panel (", key_col, ")."))
+}
+key_levels <- if (panel_order == "alphabetical") {
+  titles[[key_col]][order(tolower(titles$plot_title), titles$plot_title, method = "radix")]
+} else {
+  sort(as.character(titles[[key_col]]))
+}
+plot_base$panel_key <- factor(as.character(plot_base[[key_col]]), levels = as.character(key_levels))
+
+pdf_info <- data.frame(pdf = character(0), endpoints = integer(0), pages = integer(0), height_in = numeric(0))
+first_pages <- list()
+for (g in names(groups)) {
+  rows <- groups[[g]]$rows
+  dg <- plot_base[plot_base$endpoint %in% rows, , drop = FALSE]
+  if (nrow(dg) == 0) next
+  pages <- plot_behavior_dose_response_pages(
+    dg,
+    group_cols = "panel_key",
+    title_col = "plot_title",
+    endpoint_order = rows,
+    point_colour_col = if (by_chem) "plate_id" else NULL,
+    y_label = groups[[g]]$y,
+    title_wrap_width = title_wrap_width,
+    nrow = 1,
+    ncol = n_col
+  )
+  height <- 1.5 + pdf_height_per_row * length(unique(dg$endpoint))
+  f <- out_path(g, "pdf")
+  grDevices::pdf(f, width = pdf_width, height = height)
+  for (pg in pages) {
+    grid::grid.newpage()
+    grid::grid.draw(pg)
+  }
+  invisible(grDevices::dev.off())
+  first_pages[[g]] <- list(page = pages[[1]], height = height)
+  pdf_info <- rbind(pdf_info, data.frame(pdf = f, endpoints = length(unique(dg$endpoint)),
+                                         pages = length(pages), height_in = height))
+}
+knitr::kable(pdf_info, row.names = FALSE, caption = paste0("PDFs written (", length(key_levels),
+                                                            " panels each, width ", pdf_width, " in)."))
+```
+
+```{r}
+#| label: fig-first-pages
+#| fig-cap: "First page of the total-distance PDF."
+#| fig-width: !expr pdf_width
+#| fig-height: !expr first_pages[["total-distance"]]$height
+
+grid::grid.newpage()
+grid::grid.draw(first_pages[["total-distance"]]$page)
+```
+
+## Status and outputs
+
+```{r}
+#| label: save
+
+if (isTRUE(validation$ok)) {
+  status <- "complete"
+  status_reason <- paste0(length(unique(endpoints$plate_id)), " plate(s), ",
+                          nrow(unique(endpoints[, c("plate_id", "well_id")])), " wells, ",
+                          length(unique(endpoints$endpoint)), " endpoints. Inspect the PDFs.")
+} else {
+  status <- "failed"
+  bad <- validation$checks$code[validation$checks$status %in% c("failed", "ambiguous")]
+  status_reason <- paste0("Structural validation failed: ", paste(bad, collapse = ", "),
+                          ". See the validation table; do not use these endpoints.")
+}
+
+save_rds(endpoints, out_path("endpoints", "rds"))
+save_rds(validation, out_path("endpoint-validation", "rds"))
+outputs <- c(out_path("endpoints", "rds"), out_path("endpoint-validation", "rds"), pdf_info$pdf)
+
+manifest <- list(
+  skill = skill,
+  run_label = p$run_label,
+  status = status,
+  status_reason = status_reason,
+  rendered_at = format(Sys.time(), "%Y-%m-%dT%H:%M:%S"),
+  zfbehavior_version = as.character(utils::packageVersion("zfbehavior")),
+  upstream = lapply(ups, function(m) list(
+    run = m$.run, skill = m$skill,
+    manifest = file.path(m$.run, "outputs", basename(m$.manifest_file)), status = m$status
+  )),
+  inputs = list(list(path = file.path(imp$.run, combined_rel), md5 = md5_now,
+                     md5_matches_upstream_manifest = !md5_drift)),
+  outputs = lapply(outputs, function(f) list(path = f, md5 = md5(f))),
+  method = list(
+    wells = "keep_well == TRUE; missing response values set to 0 (replace_na_response_zero)",
+    segments = lapply(segments, function(s) c(min(s), max(s))),
+    similarity_segments = lapply(similarity_segments, function(s) c(min(s), max(s))),
+    similarity_metrics = similarity_metrics,
+    normalization = norm_used,
+    non_default_normalization = as.list(norm_tbl$endpoint_type[!norm_tbl$is_default]),
+    extra_id_cols = as.list(id_cols),
+    validation_ok = isTRUE(validation$ok)
+  ),
+  plates_excluded_by_qc = lapply(seq_len(nrow(qc_excl)), function(i) as.list(qc_excl[i, ])),
+  summary = list(
+    n_plates = length(unique(endpoints$plate_id)),
+    n_wells = nrow(unique(endpoints[, c("plate_id", "well_id")])),
+    n_endpoints = length(unique(endpoints$endpoint)),
+    n_rows = nrow(endpoints),
+    n_panels = length(key_levels),
+    pdfs = lapply(seq_len(nrow(pdf_info)), function(i) list(pdf = basename(pdf_info$pdf[i]), pages = pdf_info$pages[i]))
+  ),
+  parameters = p
+)
+yaml::write_yaml(manifest, out_path("manifest", "yml"))
+```
+
+**Status: `r status`.** `r status_reason`
+
+```{r}
+#| label: outputs
+
+knitr::kable(data.frame(output = c(outputs, out_path("manifest", "yml"))),
+             caption = "Files written by this run.")
+```

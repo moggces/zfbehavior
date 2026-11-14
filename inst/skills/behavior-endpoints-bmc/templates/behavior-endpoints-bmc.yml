@@ -1,0 +1,119 @@
+# Parameters for one behavior-endpoints-bmc run.
+# Location: <project>/analysis/behavior-endpoints-bmc/<run_label>/behavior-endpoints-bmc.yml
+# Render:   quarto render behavior-endpoints-bmc.qmd --execute-params behavior-endpoints-bmc.yml
+#
+# Every value below is a scientific/study choice. Fill it in WITH the user;
+# never guess. Values marked REQUIRED have no default.
+
+# REQUIRED. Must equal this run folder's name (letters, digits, '-', '_').
+run_label: "CHANGE_ME"
+
+# Project root relative to this run folder.
+project_root: "../../.."
+
+# REQUIRED. Exactly one complete behavior-endpoints run folder (relative to
+# the project root), plus zero or more complete intraplate-vc-qc runs made on
+# that same endpoints run, whose `excluded_plates` are dropped.
+upstream:
+  - analysis/behavior-endpoints/CHANGE_ME
+
+# Dose-response unit (one Curvep curve per unit and endpoint):
+#   per_plate - one curve per plate (default)
+#   pooled    - one curve per chemical, all its plates pooled
+table: per_plate
+
+# Chemical column of the endpoint table identifying a chemical (table:
+# pooled, and BMR scope: chemical). Empty = the upstream run's chemical_col
+# (layout by_chemical_pooled), else DTXSID.
+chemical_col: null
+
+# Endpoint types to fit (types not listed are skipped):
+# total_distance, distance_change_shift, movement_similarity.
+endpoint_types: [total_distance, distance_change_shift, movement_similarity]
+
+# Movement-similarity metric(s) to fit; empty = every metric in the
+# endpoints run (e.g. spearman, pearson).
+similarity_metrics: []
+
+# BMR (Curvep TRSH, in normalized-response units) per endpoint type.
+#   source: user        - `bmr` below is used directly (with `reason`)
+#           estimate    - first render runs Rcurvep's knee-point estimate and
+#                         stops (needs_review); the user then fills in `bmr`
+#                         and `reason` and re-renders (saved sweep reused)
+#           control_mad - BMR = median(VC) + n_mad * MAD(VC), from the
+#                         vehicle-control values chosen by `scope`:
+#                           global   - all VC wells of all plates, one BMR per
+#                                      endpoint (historical)
+#                           plate    - each plate's own VC wells (table: per_plate)
+#                           chemical - VC wells of the chemical's plates (table: pooled)
+#                         plate_medians: true = each plate's VC wells reduced
+#                         to their median first (distance_change_shift only;
+#                         >= 3 plates per BMR; not with scope: plate)
+#   rnge:   up | down | both (direction of an effect; Curvep RNGE)
+#   trsh:   estimate range [from, to, by]; null = per endpoint from the data
+#           (0 to the 95th percentile of |treated response|, 19 steps)
+#   bmr:    a number for all endpoints of the type, or a map endpoint: number;
+#           with rnge: both, a map {up: ..., down: ...} of those
+bmr:
+  total_distance:
+    source: estimate
+    rnge: both
+    trsh: [5, 95, 5]
+    bmr: {up: null, down: null}
+    reason: null
+  distance_change_shift:
+    source: control_mad
+    rnge: up
+    scope: global
+    plate_medians: false
+    n_mad: 3
+    trsh: null
+    bmr: null
+    reason: null
+  movement_similarity:
+    source: estimate
+    rnge: down
+    trsh: [5, 95, 5]
+    bmr: null
+    reason: null
+
+# BMR estimate (source: estimate). Historical similarity estimate: 10
+# bootstrap samples, seed 2022.
+estimate_n_samples: 10
+estimate_seed: 2022
+
+# BMC (Curvep): bootstrap samples and seed (historical: 1000, 2026).
+n_samples: 1000
+seed: 2026
+
+# Parallel workers for Curvep (needs the `future` package); 1 = sequential.
+workers: 1
+
+# A curve is a hit when hit_confidence > hit_threshold; BMC labels are drawn
+# on hits only (every value stays in bmc-results.rds).
+hit_threshold: 0.5
+
+# Labels: chemical (panel titles, activity facet rows) and plate (activity
+# y axis), each = these import-data columns joined with "@".
+chemical_label_cols: [CHEMICAL_NAME]
+plate_label_cols: [plate_id]
+
+# Dose-response PDFs: panels per page, page width, height per endpoint row
+# (inches), panel order (alphabetical by title | group_key).
+ncol: 4
+pdf_width: 15
+pdf_height_per_row: 2.2
+panel_order: alphabetical
+
+# Endpoints fitted (bmc-results.rds, dose-response PDFs) but left out of the
+# activity PDF, and why (required when the list is not empty). [] = all shown.
+activity_exclude_endpoints: [L1@down_auc, L2@down_auc]
+activity_exclude_reason: "historically very noisy endpoints (VC-only null: ~13% false hits at the global-MAD BMR)"
+
+# Activity PDF: plate rows per page, chemical order (alphabetical |
+# as_given), label wrap width, page size (inches).
+n_per_page: 20
+order: alphabetical
+chemical_wrap_width: 50
+activity_pdf_width: 17
+activity_pdf_height: 16

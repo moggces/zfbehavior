@@ -1,0 +1,609 @@
+---
+title: "intraplate-vc-qc"
+subtitle: "Per-plate vehicle-control QC of behavioral endpoints: baseline outliers, low movement similarity, human plate decisions"
+format:
+  html:
+    toc: true
+    code-fold: true
+    embed-resources: true
+execute:
+  warning: true
+  message: false
+params:
+  # All values come from intraplate-vc-qc.yml (--execute-params); defaults
+  # are null on purpose (nested-map defaults are not valid knitr params).
+  run_label: null
+  project_root: "../../.."
+  upstream: null
+  response_label: null
+  title_cols: null
+  outlier_degree: null
+  similarity_threshold: null
+  exclude_plates: null
+  keep_plates: null
+  pdf_width: null
+  pdf_height: null
+---
+
+<!--
+Template shipped with the zfbehavior package (inst/skills/intraplate-vc-qc/).
+Do not edit the analysis code below for a specific study -- put every
+study-specific choice in intraplate-vc-qc.yml and render with:
+
+  quarto render intraplate-vc-qc.qmd --execute-params intraplate-vc-qc.yml
+
+This document only calls exported zfbehavior functions. See
+inst/skills/CONVENTIONS.md for the run-folder / naming / manifest rules.
+-->
+
+```{r}
+#| label: setup
+#| include: false
+
+library(zfbehavior)
+
+p <- params
+skill <- "intraplate-vc-qc"
+
+stop_param <- function(msg) {
+  stop("intraplate-vc-qc parameter error: ", msg, call. = FALSE)
+}
+as_chr <- function(x) if (is.null(x)) character(0) else unlist(x, use.names = FALSE)
+or_default <- function(x, default) if (is.null(x) || length(x) == 0) default else x
+is_unset <- function(x) {
+  is.null(x) || length(x) != 1 || !nzchar(trimws(x)) || identical(x, "CHANGE_ME")
+}
+
+if (is.null(p$run_label) || !grepl("^[A-Za-z0-9_-]+$", p$run_label)) {
+  stop_param("`run_label` is required (letters, digits, '-', '_').")
+}
+upstream_run <- sub("/+$", "", as_chr(p$upstream))
+if (length(upstream_run) != 1) {
+  stop_param("`upstream` must list exactly one behavior-endpoints run folder.")
+}
+if (is_unset(p$response_label)) stop_param("`response_label` is required.")
+
+outlier_degree <- as.numeric(or_default(p$outlier_degree, 3))
+if (length(outlier_degree) != 1 || !is.finite(outlier_degree) || outlier_degree <= 0) {
+  stop_param("`outlier_degree` must be one positive number.")
+}
+similarity_threshold <- p$similarity_threshold
+if (!is.null(similarity_threshold)) {
+  similarity_threshold <- as.numeric(similarity_threshold)
+  if (length(similarity_threshold) != 1 || !is.finite(similarity_threshold) ||
+      similarity_threshold <= 0 || similarity_threshold > 1) {
+    stop_param("`similarity_threshold` must be a number in (0, 1], or null.")
+  }
+}
+title_cols <- or_default(as_chr(p$title_cols), "plate_id")
+pdf_width <- as.numeric(or_default(p$pdf_width, 15))
+pdf_height <- as.numeric(or_default(p$pdf_height, 10))
+
+# Quarto may deliver a yml list of maps as a data.frame or a list of lists.
+as_plate_table <- function(x, what) {
+  if (is.null(x) || length(x) == 0) {
+    return(data.frame(plate_id = character(0), reason = character(0), stringsAsFactors = FALSE))
+  }
+  get_col <- function(nm) {
+    if (is.data.frame(x)) {
+      v <- x[[nm]]
+      if (is.null(v)) rep(NA_character_, nrow(x)) else as.character(v)
+    } else {
+      vapply(x, function(e) if (is.null(e[[nm]])) NA_character_ else as.character(e[[nm]]), "")
+    }
+  }
+  out <- data.frame(plate_id = get_col("plate_id"), reason = get_col("reason"), stringsAsFactors = FALSE)
+  for (nm in names(out)) {
+    if (any(is.na(out[[nm]]) | !nzchar(trimws(out[[nm]])))) {
+      stop_param(paste0("every `", what, "` entry needs a non-empty `", nm, "`."))
+    }
+  }
+  if (anyDuplicated(out$plate_id)) stop_param(paste0("`", what, "` lists a plate more than once."))
+  out
+}
+exclude_tbl <- as_plate_table(p$exclude_plates, "exclude_plates")
+keep_tbl <- as_plate_table(p$keep_plates, "keep_plates")
+both <- intersect(exclude_tbl$plate_id, keep_tbl$plate_id)
+if (length(both) > 0) {
+  stop_param(paste0("plate(s) in both `exclude_plates` and `keep_plates`: ", paste(both, collapse = ", ")))
+}
+
+project_root <- normalizePath(p$project_root, mustWork = TRUE)
+out_dir <- "outputs"
+dir.create(out_dir, showWarnings = FALSE)
+out_path <- function(object, ext) {
+  file.path(out_dir, paste0(skill, "__", p$run_label, "__", object, ".", ext))
+}
+# CONVENTIONS.md section 2: every table saved to outputs/ is a tibble,
+# including tables one level inside a saved list / result object.
+save_rds <- function(x, path) {
+  as_tbl <- function(v) if (is.data.frame(v) && !inherits(v, "tbl_df")) tibble::as_tibble(v) else v
+  x <- as_tbl(x)
+  if (is.list(x) && !is.data.frame(x)) {
+    cls <- class(x)
+    x[] <- lapply(x, as_tbl)
+    class(x) <- cls
+  }
+  saveRDS(x, path)
+}
+# A previous pass's manifest / decisions must not survive a failed re-render.
+for (f in c(out_path("manifest", "yml"), out_path("plate-decisions", "rds"))) {
+  if (file.exists(f)) file.remove(f)
+}
+md5 <- function(f) unname(tools::md5sum(f))
+
+has_plotly <- requireNamespace("plotly", quietly = TRUE)
+has_reactable <- requireNamespace("reactable", quietly = TRUE)
+show_table <- function(df, page_size = 15) {
+  if (has_reactable) {
+    reactable::reactable(df, filterable = TRUE, searchable = TRUE, sortable = TRUE,
+                         defaultPageSize = page_size, striped = TRUE, compact = TRUE)
+  } else {
+    knitr::kable(df, row.names = FALSE)
+  }
+}
+type_labels <- c(
+  total_distance = "Total distance",
+  distance_change_shift = "Distance change / shift",
+  movement_similarity = "Movement similarity"
+)
+```
+
+## Run
+
+- Skill: `intraplate-vc-qc`
+- Run label: **`r p$run_label`**
+- Baseline outliers: Tukey fence, degree **`r outlier_degree`**
+- Low movement similarity: `r if (is.null(similarity_threshold)) "not applied" else paste0("vehicle-control median < ", similarity_threshold)`
+- zfbehavior version: `r as.character(utils::packageVersion("zfbehavior"))`
+- Rendered: `r format(Sys.time(), "%Y-%m-%d %H:%M:%S")`
+
+## Upstream
+
+Exactly one `complete` `behavior-endpoints` run. Its import run (for the
+vehicle-control traces) and the plates its own QC upstream runs already
+excluded are read from its manifest (`CONVENTIONS.md`, section 6).
+
+```{r}
+#| label: upstream
+
+read_manifest <- function(run) {
+  dir <- file.path(project_root, run)
+  f <- list.files(file.path(dir, "outputs"), pattern = "__manifest\\.yml$", full.names = TRUE)
+  if (length(f) != 1) {
+    stop("intraplate-vc-qc: no unique manifest found in ", file.path(dir, "outputs"), call. = FALSE)
+  }
+  m <- yaml::read_yaml(f)
+  if (!identical(m$status, "complete")) {
+    stop("intraplate-vc-qc: upstream run `", run, "` has status `", m$status,
+         "`, not `complete`. Resolve it first (", m$status_reason, ").", call. = FALSE)
+  }
+  m$.run <- run
+  m$.manifest_file <- f
+  m
+}
+check_md5 <- function(m, pattern, what) {
+  outs <- data.frame(path = vapply(m$outputs, `[[`, "", "path"),
+                     md5 = vapply(m$outputs, `[[`, "", "md5"), stringsAsFactors = FALSE)
+  rel <- outs$path[grepl(pattern, outs$path)]
+  if (length(rel) != 1) {
+    stop("intraplate-vc-qc: upstream manifest of `", m$.run, "` lists no ", what, " output.", call. = FALSE)
+  }
+  file <- file.path(project_root, m$.run, rel)
+  now <- md5(file)
+  drift <- !identical(now, outs$md5[outs$path == rel])
+  if (drift) {
+    warning("Upstream ", what, " md5 differs from its manifest (", m$.run, "): the run was ",
+            "modified after it completed. Confirm with the user before using these results.",
+            call. = FALSE)
+  }
+  list(file = file, rel = file.path(m$.run, rel), md5 = now, drift = drift)
+}
+
+ep <- read_manifest(upstream_run)
+if (!identical(ep$skill, "behavior-endpoints")) {
+  stop("intraplate-vc-qc: upstream must be a behavior-endpoints run (found `", ep$skill, "`).",
+       call. = FALSE)
+}
+ep_up_skills <- vapply(ep$upstream, function(u) as.character(u$skill), "")
+imp_run <- sub("/+$", "", as.character(ep$upstream[[which(ep_up_skills == "dataset-import-qc")]]$run))
+imp <- read_manifest(imp_run)
+endpoints_in <- check_md5(ep, "__endpoints\\.rds$", "endpoints.rds")
+combined_in <- check_md5(imp, "__combined\\.rds$", "combined.rds")
+
+prior_excl <- do.call(rbind, c(
+  list(data.frame(plate_id = character(0), reason = character(0), qc_run = character(0))),
+  lapply(ep$plates_excluded_by_qc, function(e) data.frame(
+    plate_id = as.character(e$plate_id), reason = as.character(e$reason),
+    qc_run = as.character(e$qc_run), stringsAsFactors = FALSE
+  ))
+))
+
+knitr::kable(data.frame(
+  upstream = c(ep$.run, imp$.run),
+  skill = c(ep$skill, imp$skill),
+  used_for = c("endpoints checked", "vehicle-control traces and plate labels"),
+  status = c(ep$status, imp$status),
+  md5_matches_manifest = c(!endpoints_in$drift, !combined_in$drift)
+), row.names = FALSE, caption = paste0(
+  "Upstream runs. Plates excluded before the endpoints run (already absent): ", nrow(prior_excl), "."
+))
+if (nrow(prior_excl) > 0) {
+  knitr::kable(prior_excl, row.names = FALSE,
+               caption = "Plates already excluded upstream (not in the endpoints; context only).")
+}
+```
+
+```{r}
+#| label: load
+
+endpoints <- readRDS(endpoints_in$file)
+combined <- readRDS(combined_in$file)
+missing_cols <- setdiff(title_cols, names(combined))
+if (length(missing_cols) > 0) {
+  stop_param(paste0("`title_cols` not in the import data: ", paste(missing_cols, collapse = ", ")))
+}
+plate_info <- unique(as.data.frame(combined)[combined$plate_id %in% endpoints$plate_id,
+                                             unique(c("plate_id", title_cols)), drop = FALSE])
+if (anyDuplicated(plate_info$plate_id)) stop_param("`title_cols` are not constant within each plate.")
+plate_info$plate_label <- do.call(paste, c(lapply(title_cols, function(cc) as.character(plate_info[[cc]])), sep = "@"))
+rownames(plate_info) <- NULL
+
+unknown_dec <- setdiff(c(exclude_tbl$plate_id, keep_tbl$plate_id), plate_info$plate_id)
+if (length(unknown_dec) > 0) {
+  stop_param(paste0("`exclude_plates`/`keep_plates` list unknown plate_id(s) (not in the endpoints): ",
+                    paste(unknown_dec, collapse = ", ")))
+}
+
+endpoint_order <- unique(as.data.frame(endpoints)[, c("endpoint_type", "endpoint")])
+endpoint_order <- endpoint_order[order(match(endpoint_order$endpoint_type, names(type_labels))), , drop = FALSE]
+types <- intersect(names(type_labels), endpoint_order$endpoint_type)
+sim_endpoints <- endpoint_order$endpoint[endpoint_order$endpoint_type == "movement_similarity"]
+if (!is.null(similarity_threshold) && length(sim_endpoints) == 0) {
+  stop_param("`similarity_threshold` is set, but the endpoints have no movement_similarity endpoint (set it to null).")
+}
+
+knitr::kable(data.frame(
+  plates = nrow(plate_info),
+  vc_wells = nrow(unique(endpoints[endpoints$is_vehicle_control, c("plate_id", "well_id")])),
+  endpoints = nrow(endpoint_order),
+  movement_similarity_endpoints = length(sim_endpoints)
+), caption = "Endpoints checked (from the behavior-endpoints run).")
+```
+
+## Vehicle-control baselines
+
+Each plate's **baseline** for an endpoint is `denom`, the median of its
+vehicle-control wells -- the value the plate's endpoints are normalized
+against (scale: log10(distance + 1) for total distance, AUC for distance
+change/shift, raw 0-1 similarity for movement similarity). For each
+endpoint, the baselines of all plates are compared with a Tukey fence,
+`[Q1 - k*IQR, Q3 + k*IQR]` with k = `r outlier_degree`
+(`detect_behavior_vc_baseline_outliers()`); plates outside it are flagged
+(`low`/`high`).
+
+```{r}
+#| label: baselines
+
+baseline <- detect_behavior_vc_baseline_outliers(endpoints, outlier_degree = outlier_degree)
+baseline$plate_label <- plate_info$plate_label[match(baseline$plate_id, plate_info$plate_id)]
+baseline$below_similarity_threshold <- if (is.null(similarity_threshold)) {
+  FALSE
+} else {
+  baseline$endpoint_type == "movement_similarity" & baseline$denom < similarity_threshold
+}
+distribution <- summarize_behavior_vc_distribution(endpoints, level = "plate", outlier_degree = outlier_degree)
+distribution$n_below_similarity_threshold <- vapply(distribution$endpoint, function(e) {
+  sum(baseline$below_similarity_threshold[baseline$endpoint == e])
+}, 1L)
+ord <- match(distribution$endpoint, endpoint_order$endpoint)
+distribution <- distribution[order(ord), , drop = FALSE]
+```
+
+```{r}
+#| label: tbl-distribution
+#| tbl-cap: "Distribution of plate baselines per endpoint (one value per plate). Fences use the degree above."
+
+dist_show <- as.data.frame(distribution)
+num <- vapply(dist_show, is.double, TRUE)
+dist_show[num] <- lapply(dist_show[num], signif, 4)
+show_table(dist_show[, setdiff(names(dist_show), "level")], page_size = 25)
+```
+
+### Distributions
+
+One point per plate; red = flagged outlier. Interactive in this report
+(hover for plate identity); static versions with labels are in the QC PDF.
+`r if (!is.null(similarity_threshold)) paste0("The dashed line in the movement-similarity plot is the threshold (", similarity_threshold, ").") else ""`
+
+```{r}
+#| label: baseline-plots
+
+baseline_plots <- lapply(types, function(ty) {
+  b <- baseline[baseline$endpoint_type == ty, , drop = FALSE]
+  b$endpoint <- factor(b$endpoint, levels = endpoint_order$endpoint[endpoint_order$endpoint_type == ty])
+  b <- b[order(b$endpoint), , drop = FALSE]
+  b$endpoint <- as.character(b$endpoint)
+  b$is_outlier <- b$is_outlier | b$below_similarity_threshold
+  n_flag <- length(unique(b$plate_id[b$is_outlier]))
+  pl <- plot_behavior_vc_baseline(
+    b, label_col = "plate_label",
+    title = paste0(type_labels[[ty]], ": plate vehicle-control baselines (n = ",
+                   length(unique(b$plate_id)), " plates; ", n_flag, " flagged)"),
+    y_label = "Vehicle-control baseline (denom)", jitter_alpha = 0.35
+  )
+  if (ty == "movement_similarity" && !is.null(similarity_threshold)) {
+    pl <- pl + ggplot2::geom_hline(yintercept = similarity_threshold, linetype = "dashed", colour = "red")
+  }
+  pl
+})
+names(baseline_plots) <- types
+```
+
+```{r}
+#| label: fig-baselines
+#| fig-width: 10
+#| fig-height: 5.5
+
+if (has_plotly) {
+  widgets <- lapply(baseline_plots, function(pl) {
+    pl$layers <- Filter(function(l) !inherits(l$geom, "GeomText"), pl$layers)
+    suppressWarnings(plotly::ggplotly(pl, tooltip = "text"))
+  })
+  htmltools::tagList(widgets)
+} else {
+  for (pl in baseline_plots) print(pl)
+}
+```
+
+## Flagged plates
+
+A plate is **flagged** when any endpoint baseline is a fence outlier
+`r if (!is.null(similarity_threshold)) paste0("or any movement-similarity baseline is below ", similarity_threshold) else ""`.
+The consensus table counts, per plate, how many endpoints flagged it: a
+plate flagged by many endpoints (or by related endpoints, e.g. the same
+phase) is more likely a real vehicle-control problem than one flagged by a
+single endpoint.
+
+```{r}
+#| label: flags
+
+flag_rows <- baseline[baseline$is_outlier | baseline$below_similarity_threshold, , drop = FALSE]
+n_endpoints <- nrow(endpoint_order)
+flagged_ids <- unique(flag_rows$plate_id)
+plate_flags <- data.frame(plate_id = flagged_ids, stringsAsFactors = FALSE)
+plate_flags$plate_label <- plate_info$plate_label[match(plate_flags$plate_id, plate_info$plate_id)]
+plate_flags$n_flagged_endpoints <- vapply(flagged_ids, function(id) {
+  sum(flag_rows$plate_id == id & flag_rows$is_outlier)
+}, 1L)
+plate_flags$n_endpoints <- rep(n_endpoints, length(flagged_ids))
+for (ty in types) {
+  plate_flags[[paste0("n_", ty)]] <- vapply(flagged_ids, function(id) {
+    sum(flag_rows$plate_id == id & flag_rows$is_outlier & flag_rows$endpoint_type == ty)
+  }, 1L)
+}
+plate_flags$flagged_endpoints <- vapply(flagged_ids, function(id) {
+  r <- flag_rows[flag_rows$plate_id == id & flag_rows$is_outlier, , drop = FALSE]
+  r <- r[order(match(r$endpoint, endpoint_order$endpoint)), , drop = FALSE]
+  paste0(r$endpoint, " (", r$direction, ")", collapse = ", ")
+}, "")
+plate_flags$low_similarity <- vapply(flagged_ids, function(id) {
+  r <- flag_rows[flag_rows$plate_id == id & flag_rows$below_similarity_threshold, , drop = FALSE]
+  if (nrow(r) == 0) "" else paste0(r$endpoint, " = ", signif(r$denom, 3), collapse = ", ")
+}, "")
+plate_flags$decision <- ifelse(
+  plate_flags$plate_id %in% exclude_tbl$plate_id, "exclude",
+  ifelse(plate_flags$plate_id %in% keep_tbl$plate_id, "keep", "UNRESOLVED")
+)
+plate_flags$reason <- ifelse(
+  plate_flags$plate_id %in% exclude_tbl$plate_id,
+  exclude_tbl$reason[match(plate_flags$plate_id, exclude_tbl$plate_id)],
+  ifelse(plate_flags$plate_id %in% keep_tbl$plate_id,
+         keep_tbl$reason[match(plate_flags$plate_id, keep_tbl$plate_id)], "")
+)
+plate_flags <- plate_flags[order(-plate_flags$n_flagged_endpoints, plate_flags$low_similarity == "",
+                                 tolower(plate_flags$plate_label), method = "radix"), , drop = FALSE]
+rownames(plate_flags) <- NULL
+
+decisions <- plate_info[, c("plate_id", "plate_label")]
+decisions$flagged <- decisions$plate_id %in% flagged_ids
+decisions$n_flagged_endpoints <- ifelse(
+  decisions$flagged, plate_flags$n_flagged_endpoints[match(decisions$plate_id, plate_flags$plate_id)], 0L
+)
+decisions$low_similarity <- decisions$plate_id %in% plate_flags$plate_id[plate_flags$low_similarity != ""]
+decisions$decision <- ifelse(
+  decisions$plate_id %in% exclude_tbl$plate_id, "exclude",
+  ifelse(decisions$plate_id %in% keep_tbl$plate_id, "keep",
+         ifelse(decisions$flagged, "UNRESOLVED", "keep (not flagged)"))
+)
+decisions$reason <- ifelse(
+  decisions$plate_id %in% exclude_tbl$plate_id,
+  exclude_tbl$reason[match(decisions$plate_id, exclude_tbl$plate_id)],
+  ifelse(decisions$plate_id %in% keep_tbl$plate_id,
+         keep_tbl$reason[match(decisions$plate_id, keep_tbl$plate_id)], "")
+)
+decisions$excluded <- decisions$decision == "exclude"
+decisions <- decisions[order(!decisions$flagged, -decisions$n_flagged_endpoints,
+                             tolower(decisions$plate_label), method = "radix"), , drop = FALSE]
+rownames(decisions) <- NULL
+
+unresolved <- decisions$plate_id[decisions$decision == "UNRESOLVED"]
+kept_unflagged <- intersect(keep_tbl$plate_id, decisions$plate_id[!decisions$flagged])
+
+knitr::kable(data.frame(
+  plates = nrow(decisions),
+  flagged_plates = length(flagged_ids),
+  flagged_by_baseline_outlier = sum(plate_flags$n_flagged_endpoints > 0),
+  flagged_by_low_similarity = sum(plate_flags$low_similarity != ""),
+  flagged_plate_endpoint_pairs = sum(flag_rows$is_outlier),
+  excluded = sum(decisions$excluded),
+  unresolved = length(unresolved)
+), caption = "Flag summary.")
+if (length(kept_unflagged) > 0) {
+  cat("Note: `keep_plates` lists plate(s) that are not flagged (no decision needed): ",
+      paste(kept_unflagged, collapse = ", "), "\n", sep = "")
+}
+```
+
+```{r}
+#| label: tbl-consensus
+#| tbl-cap: "Consensus: one row per flagged plate, most-flagged first. n_<type> = flagged endpoints of that type."
+
+if (nrow(plate_flags) > 0) {
+  show_table(plate_flags, page_size = 20)
+} else {
+  cat("No plate flagged.\n")
+}
+```
+
+```{r}
+#| label: tbl-flag-detail
+#| tbl-cap: "Every flagged plate x endpoint, with the baseline and the endpoint's fences."
+
+if (nrow(flag_rows) > 0) {
+  fd <- as.data.frame(flag_rows[, c("plate_id", "plate_label", "endpoint_type", "endpoint", "denom",
+                                    "lower_fence", "upper_fence", "direction", "below_similarity_threshold")])
+  num <- vapply(fd, is.double, TRUE)
+  fd[num] <- lapply(fd[num], signif, 4)
+  show_table(fd, page_size = 20)
+}
+if (nrow(exclude_tbl) > 0) {
+  knitr::kable(decisions[decisions$excluded, c("plate_id", "plate_label", "flagged", "reason")],
+               row.names = FALSE, caption = "Plates excluded by the user.")
+}
+```
+
+## QC PDF
+
+Pages 1-`r length(types)`: plate-baseline distributions per endpoint type
+(flagged plates in red, labelled); then, for each flagged plate, its
+vehicle-control well traces from the import run (`plot_raw_responses_pages()`,
+`level = "well"`, labels `VC(n_kept/n_total)`), in consensus-table order, to
+support the keep/exclude decision.
+
+```{r}
+#| label: qc-pdf
+
+qc_pdf <- out_path("qc", "pdf")
+grDevices::pdf(qc_pdf, width = pdf_width, height = pdf_height)
+for (pl in baseline_plots) print(pl)
+n_trace_pages <- 0L
+if (length(flagged_ids) > 0) {
+  segs <- lapply(ep$method$segments, function(s) seq(as.numeric(s[[1]]), as.numeric(s[[2]])))
+  d_flag <- combined[combined$plate_id %in% flagged_ids & combined$keep_well, , drop = FALSE]
+  d_flag$plot_title <- paste0(
+    plate_info$plate_label[match(d_flag$plate_id, plate_info$plate_id)], " | flagged: ",
+    plate_flags$n_flagged_endpoints[match(d_flag$plate_id, plate_flags$plate_id)], "/", n_endpoints,
+    ifelse(plate_flags$low_similarity[match(d_flag$plate_id, plate_flags$plate_id)] != "", " + low similarity", "")
+  )
+  d_flag$panel_key <- factor(d_flag$plate_id, levels = plate_flags$plate_id)
+  wc <- count_wells_by_dose(
+    combined[combined$plate_id %in% flagged_ids, , drop = FALSE],
+    group_cols = c("plate_id", "is_vehicle_control", "concentration")
+  )
+  pages <- plot_raw_responses_pages(
+    d_flag, group_cols = "panel_key", segments = segs, level = "well",
+    wells = "vehicle_control", response_label = p$response_label,
+    well_counts = wc, title_col = "plot_title"
+  )
+  for (pg in pages) {
+    grid::grid.newpage()
+    grid::grid.draw(pg)
+  }
+  n_trace_pages <- length(pages)
+}
+invisible(grDevices::dev.off())
+n_pdf_pages <- length(baseline_plots) + n_trace_pages
+
+knitr::kable(data.frame(
+  pdf = qc_pdf, pages = n_pdf_pages, distribution_pages = length(baseline_plots),
+  flagged_plates_with_vc_trace_pages = length(flagged_ids)
+), caption = "QC PDF written.")
+```
+
+## Status and outputs
+
+```{r}
+#| label: status
+
+if (length(unresolved) > 0) {
+  status <- "needs_review"
+  status_reason <- paste0(
+    length(unresolved), " flagged plate(s) need a decision: ", paste(sort(unresolved), collapse = ", "),
+    ". Inspect the consensus table, the baseline distributions and the plates' vehicle-control traces ",
+    "(QC PDF), then list each in `exclude_plates` or `keep_plates` with a reason, and re-render."
+  )
+} else {
+  status <- "complete"
+  status_reason <- paste0(
+    length(flagged_ids), " flagged plate(s) resolved; ", sum(decisions$excluded),
+    " plate(s) excluded, ", nrow(decisions) - sum(decisions$excluded), " kept."
+  )
+}
+```
+
+**Status: `r status`.** `r status_reason`
+
+```{r}
+#| label: save
+
+save_rds(baseline, out_path("baseline-outliers", "rds"))
+save_rds(distribution, out_path("distribution", "rds"))
+save_rds(plate_flags, out_path("plate-flags", "rds"))
+outputs <- c(out_path("baseline-outliers", "rds"), out_path("distribution", "rds"),
+             out_path("plate-flags", "rds"), qc_pdf)
+if (identical(status, "complete")) {
+  # Downstream-facing: written only once every flagged plate is decided.
+  save_rds(decisions, out_path("plate-decisions", "rds"))
+  outputs <- c(outputs, out_path("plate-decisions", "rds"))
+}
+
+to_entries <- function(tbl) lapply(seq_len(nrow(tbl)), function(i) as.list(tbl[i, c("plate_id", "reason")]))
+manifest <- list(
+  skill = skill,
+  run_label = p$run_label,
+  status = status,
+  status_reason = status_reason,
+  rendered_at = format(Sys.time(), "%Y-%m-%dT%H:%M:%S"),
+  zfbehavior_version = as.character(utils::packageVersion("zfbehavior")),
+  upstream = list(list(
+    run = ep$.run, skill = ep$skill,
+    manifest = file.path(ep$.run, "outputs", basename(ep$.manifest_file)), status = ep$status
+  )),
+  import_run = imp$.run,
+  inputs = list(
+    list(path = endpoints_in$rel, md5 = endpoints_in$md5, md5_matches_upstream_manifest = !endpoints_in$drift),
+    list(path = combined_in$rel, md5 = combined_in$md5, md5_matches_upstream_manifest = !combined_in$drift)
+  ),
+  outputs = lapply(outputs, function(f) list(path = f, md5 = md5(f))),
+  method = list(
+    baseline = "denom = vehicle-control median per plate x endpoint (behavior-endpoints)",
+    outlier_fence = paste0("Tukey fence across plates per endpoint, degree ", outlier_degree),
+    outlier_degree = outlier_degree,
+    similarity_threshold = similarity_threshold,
+    similarity_rule = if (is.null(similarity_threshold)) "not applied" else
+      paste0("flag if any movement_similarity baseline < ", similarity_threshold)
+  ),
+  plates_excluded_upstream = lapply(seq_len(nrow(prior_excl)), function(i) as.list(prior_excl[i, ])),
+  summary = list(
+    n_plates = nrow(decisions),
+    n_endpoints = n_endpoints,
+    n_flagged = length(flagged_ids),
+    n_flagged_by_baseline_outlier = sum(plate_flags$n_flagged_endpoints > 0),
+    n_flagged_by_low_similarity = sum(plate_flags$low_similarity != ""),
+    n_flagged_plate_endpoint_pairs = sum(flag_rows$is_outlier),
+    n_unresolved = length(unresolved),
+    n_excluded = sum(decisions$excluded),
+    n_qc_pdf_pages = n_pdf_pages
+  ),
+  flagged_plates = sort(flagged_ids),
+  # Downstream skills drop exactly these plates (CONVENTIONS.md section 6).
+  excluded_plates = to_entries(exclude_tbl),
+  kept_flagged_plates = to_entries(keep_tbl[keep_tbl$plate_id %in% flagged_ids, , drop = FALSE]),
+  parameters = p[setdiff(names(p), c("exclude_plates", "keep_plates"))]
+)
+yaml::write_yaml(manifest, out_path("manifest", "yml"))
+
+knitr::kable(data.frame(output = c(outputs, out_path("manifest", "yml"))),
+             caption = "Files written by this run.")
+```

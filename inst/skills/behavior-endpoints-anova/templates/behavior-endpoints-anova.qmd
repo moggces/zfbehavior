@@ -1,0 +1,582 @@
+---
+title: "behavior-endpoints-anova"
+subtitle: "Behavioral hit calling: ANOVA and RM-ANOVA with Dunnett post-hoc tests, per plate"
+format:
+  html:
+    toc: true
+    code-fold: true
+    embed-resources: true
+execute:
+  warning: true
+  message: false
+params:
+  # All values come from behavior-endpoints-anova.yml (--execute-params);
+  # defaults are null on purpose (nested-map defaults are not valid knitr params).
+  run_label: null
+  project_root: "../../.."
+  upstream: null
+  similarity_metrics: null
+  alpha: null
+  rmanova: null
+  seed: null
+  chemical_label_cols: null
+  plate_label_cols: null
+  activity_exclude_tests: null
+  activity_exclude_endpoints: null
+  activity_exclude_reason: null
+  n_per_page: null
+  order: null
+  chemical_wrap_width: null
+  pdf_width: null
+  pdf_height: null
+---
+
+<!--
+Template shipped with the zfbehavior package (inst/skills/behavior-endpoints-anova/).
+Do not edit the analysis code below for a specific study -- put every
+study-specific choice in behavior-endpoints-anova.yml and render with:
+
+  quarto render behavior-endpoints-anova.qmd --execute-params behavior-endpoints-anova.yml
+
+This document only calls exported zfbehavior functions. See
+inst/skills/CONVENTIONS.md for the run-folder / naming / manifest rules.
+-->
+
+```{r}
+#| label: setup
+#| include: false
+
+library(zfbehavior)
+
+p <- params
+skill <- "behavior-endpoints-anova"
+
+stop_param <- function(msg) {
+  stop("behavior-endpoints-anova parameter error: ", msg, call. = FALSE)
+}
+as_chr <- function(x) if (is.null(x)) character(0) else unlist(x, use.names = FALSE)
+or_default <- function(x, default) if (is.null(x) || length(x) == 0) default else x
+num <- function(x, default, what, lower = -Inf, upper = Inf, integer = FALSE) {
+  v <- suppressWarnings(as.numeric(or_default(x, default)))
+  if (length(v) != 1 || !is.finite(v) || v < lower || v > upper || (integer && v != round(v))) {
+    stop_param(paste0("`", what, "` must be ", if (integer) "an integer" else "a number",
+                      " in [", lower, ", ", upper, "]."))
+  }
+  v
+}
+
+if (is.null(p$run_label) || !grepl("^[A-Za-z0-9_-]+$", p$run_label)) {
+  stop_param("`run_label` is required (letters, digits, '-', '_').")
+}
+upstream_runs <- sub("/+$", "", as_chr(p$upstream))
+if (length(upstream_runs) == 0) {
+  stop_param("`upstream` must list one behavior-endpoints run (plus optional intraplate-vc-qc runs).")
+}
+similarity_metrics <- or_default(as_chr(p$similarity_metrics), "spearman")
+bad_metric <- setdiff(similarity_metrics, c("spearman", "pearson"))
+if (length(bad_metric) > 0) {
+  stop_param(paste0("`similarity_metrics` must be spearman and/or pearson (correlations, Fisher z); got: ",
+                    paste(bad_metric, collapse = ", ")))
+}
+alpha <- num(p$alpha, 0.05, "alpha", lower = 1e-12, upper = 0.5)
+rmanova_mode <- as.character(or_default(p$rmanova, "auto"))
+if (!rmanova_mode %in% c("auto", "FALSE", "false")) stop_param("`rmanova` must be auto or false.")
+rmanova_mode <- if (rmanova_mode == "auto") "auto" else "off"
+seed <- num(p$seed, 20260806, "seed", lower = 0, integer = TRUE)
+chemical_label_cols <- or_default(as_chr(p$chemical_label_cols), "CHEMICAL_NAME")
+plate_label_cols <- or_default(as_chr(p$plate_label_cols), "plate_id")
+n_per_page <- num(p$n_per_page, 20, "n_per_page", lower = 1, integer = TRUE)
+plot_order <- or_default(p$order, "alphabetical")
+if (!plot_order %in% c("alphabetical", "as_given")) stop_param("`order` must be alphabetical or as_given.")
+pdf_width <- num(p$pdf_width, 17, "pdf_width", lower = 1)
+pdf_height <- num(p$pdf_height, 16, "pdf_height", lower = 1)
+chemical_wrap_width <- num(p$chemical_wrap_width, 50, "chemical_wrap_width", lower = 5, integer = TRUE)
+activity_exclude_tests <- as_chr(p$activity_exclude_tests)
+bad_tests <- setdiff(activity_exclude_tests, c("ANOVA", "RMANOVA"))
+if (length(bad_tests) > 0) {
+  stop_param(paste0("`activity_exclude_tests` must be ANOVA and/or RMANOVA; got: ", paste(bad_tests, collapse = ", ")))
+}
+activity_exclude_endpoints <- as_chr(p$activity_exclude_endpoints)
+activity_exclude_reason <- or_default(p$activity_exclude_reason, NULL)
+if (!is.null(activity_exclude_reason) && !nzchar(trimws(as.character(activity_exclude_reason)))) {
+  activity_exclude_reason <- NULL
+}
+if ((length(activity_exclude_tests) > 0 || length(activity_exclude_endpoints) > 0) && is.null(activity_exclude_reason)) {
+  stop_param("`activity_exclude_reason` is required when `activity_exclude_tests` or `activity_exclude_endpoints` is not empty.")
+}
+
+project_root <- normalizePath(p$project_root, mustWork = TRUE)
+out_dir <- "outputs"
+dir.create(out_dir, showWarnings = FALSE)
+out_path <- function(object, ext) {
+  file.path(out_dir, paste0(skill, "__", p$run_label, "__", object, ".", ext))
+}
+for (f in list.files(out_dir, pattern = paste0("^", skill, "__", p$run_label, "__"), full.names = TRUE)) {
+  file.remove(f)
+}
+# CONVENTIONS.md section 2: every table saved to outputs/ is a tibble,
+# including tables one level inside a saved list / result object.
+save_rds <- function(x, path) {
+  as_tbl <- function(v) if (is.data.frame(v) && !inherits(v, "tbl_df")) tibble::as_tibble(v) else v
+  x <- as_tbl(x)
+  if (is.list(x) && !is.data.frame(x)) {
+    cls <- class(x)
+    x[] <- lapply(x, as_tbl)
+    class(x) <- cls
+  }
+  saveRDS(x, path)
+}
+md5 <- function(f) unname(tools::md5sum(f))
+
+has_reactable <- requireNamespace("reactable", quietly = TRUE)
+show_table <- function(df, page_size = 15) {
+  if (has_reactable) {
+    reactable::reactable(df, filterable = TRUE, searchable = TRUE, sortable = TRUE,
+                         defaultPageSize = page_size, striped = TRUE, compact = TRUE)
+  } else {
+    knitr::kable(df, row.names = FALSE)
+  }
+}
+```
+
+## Run
+
+- Skill: `behavior-endpoints-anova`
+- Run label: **`r p$run_label`**
+- Similarity metric(s): **`r paste(similarity_metrics, collapse = ", ")`**
+- alpha: `r alpha`; RM-ANOVA: `r rmanova_mode`; seed: `r seed`
+- zfbehavior version: `r as.character(utils::packageVersion("zfbehavior"))`
+- Rendered: `r format(Sys.time(), "%Y-%m-%d %H:%M:%S")`
+
+## Upstream
+
+Exactly one `complete` `behavior-endpoints` run, plus optional `complete`
+`intraplate-vc-qc` runs made on that same endpoints run, whose
+`excluded_plates` are dropped (`CONVENTIONS.md`, section 6).
+
+```{r}
+#| label: upstream
+
+read_manifest <- function(run) {
+  dir <- file.path(project_root, run)
+  f <- list.files(file.path(dir, "outputs"), pattern = "__manifest\\.yml$", full.names = TRUE)
+  if (length(f) != 1) {
+    stop("behavior-endpoints-anova: no unique manifest found in ", file.path(dir, "outputs"), call. = FALSE)
+  }
+  m <- yaml::read_yaml(f)
+  if (!identical(m$status, "complete")) {
+    stop("behavior-endpoints-anova: upstream run `", run, "` has status `", m$status,
+         "`, not `complete`. Resolve it first (", m$status_reason, ").", call. = FALSE)
+  }
+  m$.run <- run
+  m$.manifest_file <- f
+  m
+}
+check_md5 <- function(m, pattern, what) {
+  outs <- data.frame(path = vapply(m$outputs, `[[`, "", "path"),
+                     md5 = vapply(m$outputs, `[[`, "", "md5"), stringsAsFactors = FALSE)
+  rel <- outs$path[grepl(pattern, outs$path)]
+  if (length(rel) != 1) {
+    stop("behavior-endpoints-anova: upstream manifest of `", m$.run, "` lists no ", what, " output.", call. = FALSE)
+  }
+  file <- file.path(project_root, m$.run, rel)
+  now <- md5(file)
+  drift <- !identical(now, outs$md5[outs$path == rel])
+  if (drift) {
+    warning("Upstream ", what, " md5 differs from its manifest (", m$.run, "): the run was ",
+            "modified after it completed. Confirm with the user before using these results.",
+            call. = FALSE)
+  }
+  list(file = file, rel = file.path(m$.run, rel), md5 = now, drift = drift)
+}
+
+ups <- lapply(upstream_runs, read_manifest)
+up_skills <- vapply(ups, function(m) as.character(m$skill), "")
+if (sum(up_skills == "behavior-endpoints") != 1) {
+  stop_param("`upstream` must list exactly one behavior-endpoints run.")
+}
+bad_up <- setdiff(up_skills, c("behavior-endpoints", "intraplate-vc-qc"))
+if (length(bad_up) > 0) {
+  stop_param(paste0("`upstream` may list only behavior-endpoints and intraplate-vc-qc runs (got ",
+                    paste(bad_up, collapse = ", "), ")."))
+}
+ep <- ups[[which(up_skills == "behavior-endpoints")]]
+qc_runs <- ups[up_skills == "intraplate-vc-qc"]
+for (m in qc_runs) {
+  qc_up <- vapply(m$upstream, function(u) sub("/+$", "", as.character(u$run)), "")
+  if (!ep$.run %in% qc_up) {
+    stop("behavior-endpoints-anova: QC run `", m$.run, "` was made on ",
+         paste(qc_up, collapse = ", "), ", not on the endpoints run `", ep$.run, "`.", call. = FALSE)
+  }
+}
+ep_up_skills <- vapply(ep$upstream, function(u) as.character(u$skill), "")
+imp_run <- sub("/+$", "", as.character(ep$upstream[[which(ep_up_skills == "dataset-import-qc")]]$run))
+imp <- read_manifest(imp_run)
+endpoints_in <- check_md5(ep, "__endpoints\\.rds$", "endpoints.rds")
+combined_in <- check_md5(imp, "__combined\\.rds$", "combined.rds")
+
+up_tbl <- data.frame(
+  upstream = c(vapply(ups, `[[`, "", ".run"), imp$.run),
+  skill = c(up_skills, imp$skill),
+  used_for = c(ifelse(up_skills == "behavior-endpoints", "endpoints tested", "plate exclusions"),
+               "chemical/plate labels only"),
+  status = c(vapply(ups, function(m) as.character(m$status), ""), imp$status),
+  # Only intraplate-vc-qc exclusions are applied here; plates excluded before
+  # the endpoints run are already absent from its endpoints.
+  plates_dropped_here = c(ifelse(up_skills == "intraplate-vc-qc",
+                                 as.character(vapply(ups, function(m) length(m$excluded_plates), 1L)), "-"),
+                          "-"),
+  stringsAsFactors = FALSE
+)
+knitr::kable(up_tbl, row.names = FALSE, caption = paste0(
+  "Upstream runs. endpoints.rds md5 matches its manifest: ", !endpoints_in$drift,
+  ". Plates excluded before the endpoints run (already absent): ", length(ep$plates_excluded_by_qc), "."
+))
+```
+
+```{r}
+#| label: load
+
+endpoints <- readRDS(endpoints_in$file)
+combined <- readRDS(combined_in$file)
+
+qc_excl <- do.call(rbind, c(
+  list(data.frame(plate_id = character(0), reason = character(0), qc_run = character(0))),
+  lapply(qc_runs, function(m) {
+    if (length(m$excluded_plates) == 0) return(NULL)
+    data.frame(
+      plate_id = vapply(m$excluded_plates, function(e) as.character(e$plate_id), ""),
+      reason = vapply(m$excluded_plates, function(e) as.character(e$reason), ""),
+      qc_run = m$.run, stringsAsFactors = FALSE
+    )
+  })
+))
+unknown_excl <- setdiff(qc_excl$plate_id, endpoints$plate_id)
+if (length(unknown_excl) > 0) {
+  stop("behavior-endpoints-anova: QC-excluded plate(s) not in the endpoints: ",
+       paste(unknown_excl, collapse = ", "), call. = FALSE)
+}
+d <- endpoints[!endpoints$plate_id %in% qc_excl$plate_id, , drop = FALSE]
+
+label_cols <- unique(c(chemical_label_cols, plate_label_cols))
+missing_cols <- setdiff(label_cols, names(combined))
+if (length(missing_cols) > 0) {
+  stop_param(paste0("label column(s) not in the import data: ", paste(missing_cols, collapse = ", ")))
+}
+plate_info <- unique(as.data.frame(combined)[combined$plate_id %in% d$plate_id,
+                                             unique(c("plate_id", label_cols)), drop = FALSE])
+if (anyDuplicated(plate_info$plate_id)) stop_param("label columns are not constant within each plate.")
+join_cols <- function(cols) do.call(paste, c(lapply(cols, function(cc) as.character(plate_info[[cc]])), sep = "@"))
+plate_info$chemical_label <- join_cols(chemical_label_cols)
+plate_info$plate_label <- join_cols(plate_label_cols)
+dup_label <- plate_info[duplicated(plate_info[, c("chemical_label", "plate_label")]), , drop = FALSE]
+if (nrow(dup_label) > 0) {
+  stop_param("`plate_label_cols` do not identify plates uniquely within a chemical; add plate_id.")
+}
+plate_info <- plate_info[, c("plate_id", "chemical_label", "plate_label")]
+
+# Endpoint provenance (one row per endpoint label) and segment order of the run.
+endpoint_info <- unique(as.data.frame(d)[, c("endpoint", "endpoint_type", "segment", "component", "metric")])
+seg_order <- c(names(ep$method$segments), names(ep$method$similarity_segments))
+dc_segments <- intersect(names(ep$method$segments),
+                         endpoint_info$segment[endpoint_info$endpoint_type == "distance_change_shift" &
+                                                 endpoint_info$component %in% "both"])
+unknown_ex <- setdiff(activity_exclude_endpoints, endpoint_info$endpoint)
+if (length(unknown_ex) > 0) {
+  stop_param(paste0("`activity_exclude_endpoints` has endpoint(s) not in the endpoints run: ",
+                    paste(unknown_ex, collapse = ", ")))
+}
+missing_metric <- setdiff(similarity_metrics, endpoint_info$metric)
+if (length(missing_metric) > 0) {
+  stop_param(paste0("similarity metric(s) not in the endpoints run: ", paste(missing_metric, collapse = ", "),
+                    " (the run has: ", paste(stats::na.omit(unique(endpoint_info$metric)), collapse = ", "), ")."))
+}
+
+knitr::kable(data.frame(
+  plates_in_endpoints = length(unique(endpoints$plate_id)),
+  plates_excluded_by_qc = length(unique(qc_excl$plate_id)),
+  plates_tested = length(unique(d$plate_id)),
+  distance_change_segments = paste(dc_segments, collapse = ", "),
+  similarity_endpoints = paste(endpoint_info$endpoint[endpoint_info$endpoint_type == "movement_similarity" &
+                                                        endpoint_info$metric %in% similarity_metrics], collapse = ", ")
+), caption = "Data tested.")
+if (nrow(qc_excl) > 0) knitr::kable(qc_excl, row.names = FALSE, caption = "Plates excluded by intraplate-vc-qc runs.")
+```
+
+## Tests
+
+Historical method (Konrad et al. 2026), on the raw endpoint values
+(`endpoint_value_raw`), one model per plate:
+
+- **ANOVA** + Dunnett (each concentration vs vehicle control), per plate x
+  endpoint, for distance change (`both`, log10-transformed) per segment and
+  for movement similarity per selected metric (Fisher z-transformed).
+- **RM-ANOVA** (generalized least squares, AR(1) over segments) + Dunnett,
+  per plate, on distance change across all its segments: full model
+  (concentration x segment interaction) first, reduced model (concentration
+  main effect) as fallback.
+- **Hit**: omnibus (or interaction) p < alpha **and** at least one Dunnett
+  comparison p < alpha; an undecidable missing p-value gives
+  `indeterminate`.
+
+No correction for multiple testing across endpoints or metrics is applied
+(as in the historical method): each endpoint/metric is a separate test, so
+testing two similarity metrics roughly doubles the chance of a false hit for
+movement similarity.
+
+```{r}
+#| label: anova
+
+transforms <- c(list(both_auc = "log10"),
+                stats::setNames(as.list(rep("fisher_z", length(similarity_metrics))), similarity_metrics))
+set.seed(seed)
+anova_result <- run_anova(
+  d, group_cols = c("plate_id", "endpoint"), value_col = "endpoint_value_raw",
+  endpoint_transforms = transforms
+)
+
+run_rm <- rmanova_mode == "auto" && length(dc_segments) >= 2
+rmanova_note <- if (rmanova_mode == "off") {
+  "not run (rmanova: false)"
+} else if (!run_rm) {
+  paste0("skipped: only ", length(dc_segments), " distance-change segment(s) (needs >= 2)")
+} else {
+  paste0("run over ", length(dc_segments), " segments: ", paste(dc_segments, collapse = ", "))
+}
+rmanova_result <- NULL
+if (run_rm) {
+  set.seed(seed)
+  rmanova_result <- run_rmanova(
+    d, group_cols = "plate_id", phase_levels = dc_segments, phase_col = "segment",
+    value_col = "endpoint_value_raw", endpoint_transforms = list(both_auc = "log10")
+  )
+}
+
+hits <- run_anova_rmanova_hit_calling(
+  anova_result, rmanova_result,
+  anova_group_cols = c("plate_id", "endpoint"),
+  rmanova_group_cols = if (run_rm) "plate_id" else NULL,
+  alpha = alpha
+)
+hits <- dplyr::left_join(hits, endpoint_info, by = "endpoint")
+hits <- dplyr::left_join(hits, plate_info, by = "plate_id")
+hits$endpoint[hits$test == "RMANOVA"] <- "distance change (all segments)"
+hits <- tibble::as_tibble(hits[, c("plate_id", "chemical_label", "plate_label", "test", "endpoint",
+                                   "endpoint_type", "segment", "component", "metric",
+                                   setdiff(names(hits), c("plate_id", "chemical_label", "plate_label", "test",
+                                                          "endpoint", "endpoint_type", "segment",
+                                                          "component", "metric")))])
+
+knitr::kable(data.frame(
+  anova_models = nrow(anova_result$anova),
+  dunnett_comparisons = nrow(anova_result$dunn),
+  rmanova = rmanova_note
+), caption = "Models fitted.")
+```
+
+## Hits
+
+```{r}
+#| label: tbl-hit-counts
+#| tbl-cap: "Decisions per test and endpoint (plates)."
+
+hit_counts <- hits |>
+  dplyr::group_by(.data$test, .data$endpoint) |>
+  dplyr::summarise(
+    plates = dplyr::n(),
+    hit = sum(.data$decision_state == "hit"),
+    not_hit = sum(.data$decision_state == "not_hit"),
+    indeterminate = sum(.data$decision_state == "indeterminate"),
+    .groups = "drop"
+  )
+hit_counts <- hit_counts[order(hit_counts$test == "RMANOVA",
+                               match(hits$segment[match(hit_counts$endpoint, hits$endpoint)], seg_order)), ]
+knitr::kable(hit_counts, row.names = FALSE)
+```
+
+```{r}
+#| label: metric-agreement
+#| results: asis
+
+metric_agreement <- NULL
+sim_hits <- hits[hits$test == "ANOVA" & hits$endpoint_type %in% "movement_similarity", , drop = FALSE]
+if (length(similarity_metrics) >= 2 && nrow(sim_hits) > 0) {
+  cat("### Similarity metrics compared\n\n",
+      "Per plate and similarity window: hit by which metric(s). Disagreements show where the result ",
+      "depends on the metric.\n\n", sep = "")
+  wide <- tidyr::pivot_wider(
+    sim_hits[, c("plate_id", "segment", "metric", "decision_state")],
+    names_from = "metric", values_from = "decision_state"
+  )
+  wide$hit_by <- apply(wide[, similarity_metrics, drop = FALSE], 1, function(r) {
+    h <- similarity_metrics[!is.na(r) & r == "hit"]
+    if (length(h) == 0) "none" else if (length(h) == length(similarity_metrics)) "all" else paste(h, collapse = ", ")
+  })
+  metric_agreement <- dplyr::count(wide, .data$segment, .data$hit_by, name = "plates")
+  print(knitr::kable(metric_agreement, row.names = FALSE, caption = "Movement-similarity hits by metric."))
+}
+```
+
+```{r}
+#| label: tbl-hits
+#| tbl-cap: "All decisions (filter decision_state = hit for the hits). hit_p_value = p-value of the test that decided the hit."
+
+show_cols <- c("chemical_label", "plate_label", "plate_id", "test", "endpoint",
+               "decision_state", "decision_source", "hit_p_value", "p_value",
+               "p_value_interaction_full", "p_value_conc_unit_reduced",
+               "n_posthoc_sig", "n_posthoc_sig_full", "n_posthoc_sig_reduced")
+# RM-ANOVA columns exist only when RM-ANOVA was run.
+show_hits <- as.data.frame(hits[, intersect(show_cols, names(hits))])
+num_cols <- vapply(show_hits, is.double, TRUE)
+show_hits[num_cols] <- lapply(show_hits[num_cols], signif, 3)
+show_table(show_hits, page_size = 20)
+```
+
+```{r}
+#| label: indeterminate
+#| results: asis
+
+n_ind <- sum(hits$decision_state == "indeterminate")
+if (n_ind > 0) {
+  cat("**", n_ind, " indeterminate decision(s)** (a missing p-value prevents a decision); see the ",
+      "table above (decision_state = indeterminate).\n", sep = "")
+}
+```
+
+## Activity plot
+
+`plot_behavior_anova_activity_pages()`: chemicals as facet rows
+(`r plot_order`; `r n_per_page` plate rows per page, whole chemicals, pages
+padded so a plate row has the same height on every page), plates (the
+tested units) as rows within a chemical,
+columns = distance change and one movement-similarity column per metric,
+x = segments (RM-ANOVA hits at "all phases (RM)"). Point size = p-value
+class of the deciding test; only hits are drawn. Left out of this plot:
+`r if (length(activity_exclude_tests) + length(activity_exclude_endpoints) == 0) "nothing" else paste(c(activity_exclude_tests, activity_exclude_endpoints), collapse = ", ")`.
+
+```{r}
+#| label: activity-pdf
+#| results: asis
+
+activity <- hits[, c("plate_id", "chemical_label", "plate_label", "test", "endpoint", "endpoint_type",
+                     "segment", "component", "metric", "decision_state", "hit_p_value")]
+activity$in_activity_pdf <- !(activity$test %in% activity_exclude_tests |
+                                (activity$test == "ANOVA" & activity$endpoint %in% activity_exclude_endpoints))
+n_hits_not_in_activity <- sum(activity$decision_state == "hit" & !activity$in_activity_pdf)
+if (!all(activity$in_activity_pdf)) {
+  left_out <- activity[!activity$in_activity_pdf, , drop = FALSE]
+  left_out <- stats::aggregate(list(hits_not_plotted = left_out$decision_state == "hit"),
+                               left_out[, c("test", "endpoint")], sum)
+  print(knitr::kable(left_out, row.names = FALSE, caption = paste0(
+    "Results left out of the activity PDF (reason: ", activity_exclude_reason,
+    "). They stay in hits.rds and activity.rds (in_activity_pdf = FALSE).")))
+}
+plot_rows <- activity[activity$in_activity_pdf, , drop = FALSE]
+if (nrow(plot_rows) == 0) stop_param("the activity exclusions leave nothing to plot.")
+pages <- plot_behavior_anova_activity_pages(
+  plot_rows, chemical_col = "chemical_label", plate_label_col = "plate_label",
+  segment_levels = seg_order, order = plot_order, n_per_page = n_per_page,
+  page_height = pdf_height, chemical_wrap_width = chemical_wrap_width
+)
+label_fit <- attr(pages, "label_fit")
+n_label_overflow <- sum(!label_fit$fits)
+activity_pdf <- out_path("activity", "pdf")
+# cairo_pdf renders non-ASCII chemical names (e.g. Greek letters).
+dev_fun <- if (capabilities("cairo")) grDevices::cairo_pdf else grDevices::pdf
+dev_fun(activity_pdf, width = pdf_width, height = pdf_height, onefile = TRUE)
+for (pg in pages) {
+  grid::grid.newpage()
+  grid::grid.draw(pg)
+}
+invisible(grDevices::dev.off())
+
+print(knitr::kable(data.frame(pdf = activity_pdf, pages = length(pages),
+                              chemicals = length(unique(plot_rows$chemical_label)),
+                              plate_rows_per_page = paste(attr(pages, "page_plate_rows"), collapse = ", "),
+                              labels_not_fitting = n_label_overflow),
+                   caption = "Activity PDF written."))
+if (n_label_overflow > 0) {
+  warning(n_label_overflow, " chemical label(s) are taller than their panel at pdf_height = ", pdf_height,
+          " in: increase `pdf_height` or `chemical_wrap_width` (see the table below).", call. = FALSE)
+  print(knitr::kable(as.data.frame(label_fit[!label_fit$fits, ]), row.names = FALSE,
+                     caption = "Chemical labels that do not fit their panel."))
+}
+```
+
+## Status and outputs
+
+```{r}
+#| label: save
+
+status <- "complete"
+n_hit_plates <- length(unique(hits$plate_id[hits$decision_state == "hit"]))
+status_reason <- paste0(length(unique(hits$plate_id)), " plate(s) tested; ",
+                        sum(hits$decision_state == "hit"), " hit(s) on ", n_hit_plates, " plate(s); ",
+                        sum(hits$decision_state == "indeterminate"), " indeterminate. Inspect the activity PDF.")
+
+save_rds(anova_result, out_path("anova", "rds"))
+outputs <- out_path("anova", "rds")
+if (run_rm) {
+  save_rds(rmanova_result, out_path("rmanova", "rds"))
+  outputs <- c(outputs, out_path("rmanova", "rds"))
+}
+save_rds(hits, out_path("hits", "rds"))
+save_rds(activity, out_path("activity", "rds"))
+outputs <- c(outputs, out_path("hits", "rds"), out_path("activity", "rds"), activity_pdf)
+
+count_list <- lapply(seq_len(nrow(hit_counts)), function(i) as.list(hit_counts[i, ]))
+manifest <- list(
+  skill = skill,
+  run_label = p$run_label,
+  status = status,
+  status_reason = status_reason,
+  rendered_at = format(Sys.time(), "%Y-%m-%dT%H:%M:%S"),
+  zfbehavior_version = as.character(utils::packageVersion("zfbehavior")),
+  upstream = lapply(ups, function(m) list(
+    run = m$.run, skill = m$skill,
+    manifest = file.path(m$.run, "outputs", basename(m$.manifest_file)), status = m$status
+  )),
+  import_run = imp$.run,
+  inputs = list(
+    list(path = endpoints_in$rel, md5 = endpoints_in$md5, md5_matches_upstream_manifest = !endpoints_in$drift),
+    list(path = combined_in$rel, md5 = combined_in$md5, md5_matches_upstream_manifest = !combined_in$drift)
+  ),
+  outputs = lapply(outputs, function(f) list(path = f, md5 = md5(f))),
+  method = list(
+    value = "endpoint_value_raw",
+    anova = "per plate x endpoint; aov + DescTools::DunnettTest vs vehicle control",
+    transforms = transforms,
+    similarity_metrics = similarity_metrics,
+    rmanova = rmanova_note,
+    rmanova_segments = if (run_rm) dc_segments else list(),
+    alpha = alpha,
+    seed = seed,
+    multiple_testing_correction = "none across endpoints/metrics (historical method)",
+    activity_exclude_tests = as.list(activity_exclude_tests),
+    activity_exclude_endpoints = as.list(activity_exclude_endpoints),
+    activity_exclude_reason = activity_exclude_reason
+  ),
+  plates_excluded_by_qc = lapply(seq_len(nrow(qc_excl)), function(i) as.list(qc_excl[i, ])),
+  summary = list(
+    n_plates = length(unique(hits$plate_id)),
+    n_hits = sum(hits$decision_state == "hit"),
+    n_hit_plates = n_hit_plates,
+    n_indeterminate = sum(hits$decision_state == "indeterminate"),
+    n_pdf_pages = length(pages),
+    n_labels_not_fitting = n_label_overflow,
+    n_hits_not_in_activity = n_hits_not_in_activity,
+    counts = count_list
+  ),
+  parameters = p
+)
+yaml::write_yaml(manifest, out_path("manifest", "yml"))
+```
+
+**Status: `r status`.** `r status_reason`
+
+```{r}
+#| label: outputs
+
+knitr::kable(data.frame(output = c(outputs, out_path("manifest", "yml"))),
+             caption = "Files written by this run.")
+```

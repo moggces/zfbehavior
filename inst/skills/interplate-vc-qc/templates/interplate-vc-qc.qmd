@@ -1,0 +1,574 @@
+---
+title: "interplate-vc-qc"
+subtitle: "Inter-plate vehicle-control QC: plate reference patterns, PCA, outlier plates, human plate decisions"
+format:
+  html:
+    toc: true
+    code-fold: true
+    embed-resources: true
+execute:
+  warning: true
+  message: false
+params:
+  # All values come from interplate-vc-qc.yml (--execute-params); defaults
+  # are null on purpose (nested-map defaults are not valid knitr params).
+  run_label: null
+  project_root: "../../.."
+  upstream: null
+  cohort_note: null
+  segments: null
+  segment_style: null
+  response_label: null
+  title_cols: null
+  summary_type: null
+  conf_level: null
+  flag_method: null
+  exclude_plates: null
+  keep_plates: null
+  pdf_width: null
+  pdf_height: null
+---
+
+<!--
+Template shipped with the zfbehavior package (inst/skills/interplate-vc-qc/).
+Do not edit the analysis code below for a specific study -- put every
+study-specific choice in interplate-vc-qc.yml and render with:
+
+  quarto render interplate-vc-qc.qmd --execute-params interplate-vc-qc.yml
+
+This document only calls exported zfbehavior functions. See
+inst/skills/CONVENTIONS.md for the run-folder / naming / manifest rules.
+-->
+
+```{r}
+#| label: setup
+#| include: false
+
+library(zfbehavior)
+
+p <- params
+skill <- "interplate-vc-qc"
+
+stop_param <- function(msg) {
+  stop("interplate-vc-qc parameter error: ", msg, call. = FALSE)
+}
+as_chr <- function(x) if (is.null(x)) character(0) else unlist(x, use.names = FALSE)
+or_default <- function(x, default) if (is.null(x) || length(x) == 0) default else x
+is_unset <- function(x) {
+  is.null(x) || length(x) != 1 || !nzchar(trimws(x)) || identical(x, "CHANGE_ME")
+}
+
+if (is.null(p$run_label) || !grepl("^[A-Za-z0-9_-]+$", p$run_label)) {
+  stop_param("`run_label` is required (letters, digits, '-', '_').")
+}
+if (length(as_chr(p$upstream)) != 1) {
+  stop_param("`upstream` must list exactly one dataset-import-qc run folder.")
+}
+if (is_unset(p$cohort_note)) {
+  stop_param("`cohort_note` is required (why these plates form one comparison cohort).")
+}
+if (is.null(p$segments) || length(p$segments) == 0) {
+  stop_param("`segments` is required (confirm the assay phase windows with the user).")
+}
+if (is_unset(p$response_label)) stop_param("`response_label` is required.")
+
+summary_type <- or_default(p$summary_type, "median")
+if (!summary_type %in% c("median", "mean")) stop_param("`summary_type` must be median or mean.")
+conf_level <- as.numeric(or_default(p$conf_level, 0.95))
+if (length(conf_level) != 1 || !is.finite(conf_level) || conf_level <= 0 || conf_level >= 1) {
+  stop_param("`conf_level` must be a number strictly between 0 and 1.")
+}
+flag_method <- or_default(p$flag_method, "ellipse_normal")
+if (!flag_method %in% c("ellipse_normal", "ellipse_t")) {
+  stop_param("`flag_method` must be ellipse_normal or ellipse_t.")
+}
+title_cols <- or_default(as_chr(p$title_cols), "plate_id")
+pdf_width <- as.numeric(or_default(p$pdf_width, 15))
+pdf_height <- as.numeric(or_default(p$pdf_height, 10))
+
+segments <- lapply(names(p$segments), function(nm) {
+  s <- p$segments[[nm]]
+  if (!is.list(s) || is.null(s$from) || is.null(s$to)) {
+    stop_param(paste0("segment `", nm, "` must be given as {from: <first>, to: <last>}."))
+  }
+  from <- as.numeric(s$from)
+  to <- as.numeric(s$to)
+  if (length(from) != 1 || length(to) != 1 || !is.finite(from) || !is.finite(to) || to < from) {
+    stop_param(paste0("segment `", nm, "` needs numeric from <= to."))
+  }
+  seq(from, to)
+})
+names(segments) <- names(p$segments)
+segment_style <- p$segment_style
+if (!is.null(segment_style)) {
+  unknown_style <- setdiff(names(segment_style), names(segments))
+  if (length(unknown_style) > 0) {
+    stop_param(paste0("`segment_style` names unknown segment(s): ", paste(unknown_style, collapse = ", ")))
+  }
+}
+
+# Quarto may deliver a yml list of maps as a data.frame or a list of lists.
+as_plate_table <- function(x, what) {
+  if (is.null(x) || length(x) == 0) {
+    return(data.frame(plate_id = character(0), reason = character(0), stringsAsFactors = FALSE))
+  }
+  get_col <- function(nm) {
+    if (is.data.frame(x)) {
+      v <- x[[nm]]
+      if (is.null(v)) rep(NA_character_, nrow(x)) else as.character(v)
+    } else {
+      vapply(x, function(e) if (is.null(e[[nm]])) NA_character_ else as.character(e[[nm]]), "")
+    }
+  }
+  out <- data.frame(plate_id = get_col("plate_id"), reason = get_col("reason"), stringsAsFactors = FALSE)
+  for (nm in names(out)) {
+    if (any(is.na(out[[nm]]) | !nzchar(trimws(out[[nm]])))) {
+      stop_param(paste0("every `", what, "` entry needs a non-empty `", nm, "`."))
+    }
+  }
+  if (anyDuplicated(out$plate_id)) stop_param(paste0("`", what, "` lists a plate more than once."))
+  out
+}
+exclude_tbl <- as_plate_table(p$exclude_plates, "exclude_plates")
+keep_tbl <- as_plate_table(p$keep_plates, "keep_plates")
+both <- intersect(exclude_tbl$plate_id, keep_tbl$plate_id)
+if (length(both) > 0) {
+  stop_param(paste0("plate(s) in both `exclude_plates` and `keep_plates`: ", paste(both, collapse = ", ")))
+}
+
+project_root <- normalizePath(p$project_root, mustWork = TRUE)
+out_dir <- "outputs"
+dir.create(out_dir, showWarnings = FALSE)
+out_path <- function(object, ext) {
+  file.path(out_dir, paste0(skill, "__", p$run_label, "__", object, ".", ext))
+}
+# CONVENTIONS.md section 2: every table saved to outputs/ is a tibble,
+# including tables one level inside a saved list / result object.
+save_rds <- function(x, path) {
+  as_tbl <- function(v) if (is.data.frame(v) && !inherits(v, "tbl_df")) tibble::as_tibble(v) else v
+  x <- as_tbl(x)
+  if (is.list(x) && !is.data.frame(x)) {
+    cls <- class(x)
+    x[] <- lapply(x, as_tbl)
+    class(x) <- cls
+  }
+  saveRDS(x, path)
+}
+# A previous pass's manifest / decisions must not survive a failed re-render.
+for (f in c(out_path("manifest", "yml"), out_path("plate-decisions", "rds"))) {
+  if (file.exists(f)) file.remove(f)
+}
+md5 <- function(f) unname(tools::md5sum(f))
+
+has_plotly <- requireNamespace("plotly", quietly = TRUE)
+has_reactable <- requireNamespace("reactable", quietly = TRUE)
+show_table <- function(df, page_size = 15) {
+  if (has_reactable) {
+    reactable::reactable(df, filterable = TRUE, searchable = TRUE, sortable = TRUE,
+                         defaultPageSize = page_size, striped = TRUE, compact = TRUE)
+  } else {
+    knitr::kable(df, row.names = FALSE)
+  }
+}
+```
+
+## Run
+
+- Skill: `interplate-vc-qc`
+- Run label: **`r p$run_label`**
+- Cohort: `r p$cohort_note`
+- Flag method: **`r flag_method`** at `r conf_level * 100`% confidence (both
+  `ellipse_normal` and `ellipse_t` are computed and shown)
+- zfbehavior version: `r as.character(utils::packageVersion("zfbehavior"))`
+- Rendered: `r format(Sys.time(), "%Y-%m-%d %H:%M:%S")`
+
+## Upstream
+
+The upstream `dataset-import-qc` run must be `complete`: its output holds only
+single-larva wells, and every plate has at least one kept vehicle-control
+well (see `CONVENTIONS.md`, section 6).
+
+```{r}
+#| label: upstream
+
+upstream_dir <- file.path(project_root, as_chr(p$upstream))
+up_manifest_files <- list.files(file.path(upstream_dir, "outputs"),
+                                pattern = "__manifest\\.yml$", full.names = TRUE)
+if (length(up_manifest_files) != 1) {
+  stop("interplate-vc-qc: no unique manifest found in ", file.path(upstream_dir, "outputs"),
+       call. = FALSE)
+}
+up <- yaml::read_yaml(up_manifest_files)
+if (!identical(up$skill, "dataset-import-qc")) {
+  stop("interplate-vc-qc: upstream must be a dataset-import-qc run (found `", up$skill, "`).",
+       call. = FALSE)
+}
+if (!identical(up$status, "complete")) {
+  stop("interplate-vc-qc: upstream run `", as_chr(p$upstream), "` has status `", up$status,
+       "`, not `complete`. Resolve it first (", up$status_reason, ").", call. = FALSE)
+}
+if (!identical(up$well_contract, "single_larva_wells_only")) {
+  stop("interplate-vc-qc: upstream manifest does not declare `well_contract: ",
+       "single_larva_wells_only` (made by an older dataset-import-qc template?). ",
+       "Re-run dataset-import-qc with the current skill.", call. = FALSE)
+}
+
+up_outputs <- data.frame(
+  path = vapply(up$outputs, `[[`, "", "path"),
+  md5 = vapply(up$outputs, `[[`, "", "md5"),
+  stringsAsFactors = FALSE
+)
+combined_rel <- up_outputs$path[grepl("__combined\\.rds$", up_outputs$path)]
+if (length(combined_rel) != 1) {
+  stop("interplate-vc-qc: upstream manifest lists no combined.rds output.", call. = FALSE)
+}
+combined_file <- file.path(upstream_dir, combined_rel)
+md5_now <- md5(combined_file)
+md5_drift <- !identical(md5_now, up_outputs$md5[up_outputs$path == combined_rel])
+if (md5_drift) {
+  warning("Upstream combined.rds md5 differs from its manifest: the upstream run was ",
+          "modified after it completed. Confirm with the user before using these results.",
+          call. = FALSE)
+}
+
+knitr::kable(data.frame(
+  upstream = as_chr(p$upstream),
+  status = up$status,
+  well_contract = up$well_contract,
+  min_kept_vc_pct = if (is.null(up$min_kept_vc_pct)) "none" else as.character(up$min_kept_vc_pct),
+  rendered_at = up$rendered_at,
+  md5_matches_manifest = !md5_drift
+), caption = "Upstream run.")
+```
+
+```{r}
+#| label: load
+
+combined <- readRDS(combined_file)
+missing_cols <- setdiff(c(interplate_qc_input_cols(), raw_plot_input_cols(), title_cols), names(combined))
+if (length(missing_cols) > 0) {
+  stop_param(paste0("column(s) not in the upstream data: ", paste(missing_cols, collapse = ", ")))
+}
+times <- sort(unique(combined$time_value))
+seg_times <- unlist(segments, use.names = FALSE)
+not_in_data <- setdiff(seg_times, times)
+if (length(not_in_data) > 0) {
+  stop_param(paste0("segment time_value(s) not present in the data: ",
+                    paste(utils::head(not_in_data, 10), collapse = ", ")))
+}
+if (anyDuplicated(seg_times)) {
+  stop_param(paste0("segments overlap at time_value(s): ",
+                    paste(unique(seg_times[duplicated(seg_times)]), collapse = ", ")))
+}
+
+# Plate identity (constant per plate) for tables, hover text, titles.
+plate_info <- unique(combined[, unique(c("plate_id", title_cols)), drop = FALSE])
+if (anyDuplicated(plate_info$plate_id)) {
+  stop_param("`title_cols` are not constant within each plate.")
+}
+plate_info$plate_label <- do.call(paste, c(lapply(title_cols, function(cc) as.character(plate_info[[cc]])), sep = "@"))
+plate_info <- as.data.frame(plate_info)
+
+unknown_dec <- setdiff(c(exclude_tbl$plate_id, keep_tbl$plate_id), plate_info$plate_id)
+if (length(unknown_dec) > 0) {
+  stop_param(paste0("`exclude_plates`/`keep_plates` list unknown plate_id(s): ",
+                    paste(unknown_dec, collapse = ", ")))
+}
+
+eligible <- combined[combined$keep_well, , drop = FALSE]
+knitr::kable(data.frame(
+  plates = nrow(plate_info),
+  kept_vc_wells = nrow(unique(eligible[eligible$is_vehicle_control, c("plate_id", "well_id")])),
+  timepoints = length(times)
+), caption = "Cohort (all plates of the upstream run).")
+```
+
+## Reference patterns and PCA
+
+Each plate is reduced to one reference movement pattern (the
+`r summary_type` of its kept vehicle-control wells per timepoint,
+`calculate_plate_reference_pattern()`); plates are then compared with a PCA
+on these patterns (`fit_plate_pca()`, PC1/PC2).
+
+```{r}
+#| label: pca
+
+reference_pattern <- calculate_plate_reference_pattern(
+  eligible, summary_type = summary_type, missing_value_policy = "impute_zero"
+)
+missing_ref <- setdiff(plate_info$plate_id, unique(reference_pattern$plate_id))
+if (length(missing_ref) > 0) {
+  stop("interplate-vc-qc: plate(s) without a vehicle-control reference pattern: ",
+       paste(missing_ref, collapse = ", "),
+       ". The upstream import should have flagged these (no kept vehicle-control well); ",
+       "re-run dataset-import-qc with the current skill.", call. = FALSE)
+}
+pca <- fit_plate_pca(reference_pattern, n_pc = 2)
+
+knitr::kable(data.frame(
+  plates = nrow(pca$scores),
+  PC1_pct_var = round(pca$percent_var[["PC1"]], 2),
+  PC2_pct_var = round(pca$percent_var[["PC2"]], 2)
+), caption = "PCA on plate reference patterns.")
+```
+
+## Outlier plates
+
+A plate is an outlier when its (PC1, PC2) point lies outside the
+`r conf_level * 100`% confidence ellipse: `ellipse_normal` (bivariate normal,
+dashed) or `ellipse_t` (robust t, solid) -- the same regions drawn in the
+plot. **Flagged** plates are those of the flag method (`r flag_method`).
+
+```{r}
+#| label: outliers
+
+out_normal <- detect_plate_pca_outliers(pca, method = "ellipse_normal", conf_level = conf_level)
+out_t <- detect_plate_pca_outliers(pca, method = "ellipse_t", conf_level = conf_level)
+outliers_flag <- if (flag_method == "ellipse_normal") out_normal else out_t
+
+decisions <- data.frame(plate_id = out_normal$plate_id, stringsAsFactors = FALSE)
+decisions <- merge(plate_info[, c("plate_id", "plate_label")], decisions, by = "plate_id")
+decisions$PC1 <- round(out_normal$PC1[match(decisions$plate_id, out_normal$plate_id)], 3)
+decisions$PC2 <- round(out_normal$PC2[match(decisions$plate_id, out_normal$plate_id)], 3)
+decisions$distance_normal <- round(out_normal$distance[match(decisions$plate_id, out_normal$plate_id)], 3)
+decisions$outlier_normal <- out_normal$is_outlier[match(decisions$plate_id, out_normal$plate_id)]
+decisions$distance_t <- round(out_t$distance[match(decisions$plate_id, out_t$plate_id)], 3)
+decisions$outlier_t <- out_t$is_outlier[match(decisions$plate_id, out_t$plate_id)]
+decisions$flagged <- if (flag_method == "ellipse_normal") decisions$outlier_normal else decisions$outlier_t
+decisions$decision <- ifelse(
+  decisions$plate_id %in% exclude_tbl$plate_id, "exclude",
+  ifelse(decisions$plate_id %in% keep_tbl$plate_id, "keep",
+         ifelse(decisions$flagged, "UNRESOLVED", "keep (not flagged)"))
+)
+decisions$reason <- ifelse(
+  decisions$plate_id %in% exclude_tbl$plate_id,
+  exclude_tbl$reason[match(decisions$plate_id, exclude_tbl$plate_id)],
+  ifelse(decisions$plate_id %in% keep_tbl$plate_id,
+         keep_tbl$reason[match(decisions$plate_id, keep_tbl$plate_id)], "")
+)
+decisions$excluded <- decisions$decision == "exclude"
+decisions <- decisions[order(!decisions$flagged, !(decisions$outlier_normal | decisions$outlier_t),
+                             -pmax(decisions$distance_normal, decisions$distance_t)), , drop = FALSE]
+rownames(decisions) <- NULL
+cutoff <- unique(out_normal$cutoff)
+
+unresolved <- decisions$plate_id[decisions$decision == "UNRESOLVED"]
+kept_unflagged <- intersect(keep_tbl$plate_id, decisions$plate_id[!decisions$flagged])
+
+knitr::kable(data.frame(
+  plates = nrow(decisions),
+  flagged_ellipse_normal = sum(decisions$outlier_normal),
+  flagged_ellipse_t = sum(decisions$outlier_t),
+  flagged_by_both = sum(decisions$outlier_normal & decisions$outlier_t),
+  flagged_used = sum(decisions$flagged),
+  excluded = sum(decisions$excluded),
+  unresolved = length(unresolved),
+  cutoff_sq_mahalanobis = round(cutoff, 3)
+), caption = paste0("Outlier plates at ", conf_level * 100, "% confidence; flags used: ", flag_method, "."))
+if (length(kept_unflagged) > 0) {
+  cat("Note: `keep_plates` lists plate(s) that are not flagged (no decision needed): ",
+      paste(kept_unflagged, collapse = ", "), "\n", sep = "")
+}
+```
+
+```{r}
+#| label: tbl-outlier-plates
+#| tbl-cap: "Plates flagged by either method (flag-method plates first), with decisions."
+
+show_table(decisions[decisions$outlier_normal | decisions$outlier_t | decisions$excluded,
+                     setdiff(names(decisions), "excluded"), drop = FALSE])
+```
+
+### QC plots
+
+Interactive in this report (hover for plate identity); static versions are
+in `outputs/interplate-vc-qc__<run>__qc.pdf`. Orange = flagged by the flag
+method.
+
+```{r}
+#| label: qc-plots
+
+pca_plot <- plot_plate_pca_ellipse(
+  pca, outliers_flag, conf_level = conf_level,
+  title = paste0("Inter-plate PCA (n = ", nrow(pca$scores), " plates); flagged: ", flag_method)
+)
+overlay_plot <- plot_plate_reference_overlay(
+  reference_pattern, outliers_flag, segments,
+  segment_style = segment_style, response_label = p$response_label
+)
+```
+
+```{r}
+#| label: fig-pca-ellipse
+#| fig-cap: "PC1 vs PC2 of plate reference patterns; dashed = normal, solid = t confidence ellipse."
+#| fig-width: 8
+#| fig-height: 7
+
+if (has_plotly) {
+  hover_pca <- merge(pca$scores, plate_info[, c("plate_id", "plate_label")], by = "plate_id")
+  hover_pca$hover <- paste0("Plate: ", hover_pca$plate_id, "<br>", hover_pca$plate_label)
+  p_int <- pca_plot + ggplot2::geom_point(
+    data = hover_pca, mapping = ggplot2::aes(x = .data$PC1, y = .data$PC2, text = .data$hover),
+    alpha = 0, inherit.aes = FALSE
+  )
+  suppressWarnings(plotly::ggplotly(p_int, tooltip = "text"))
+} else {
+  pca_plot
+}
+```
+
+```{r}
+#| label: fig-reference-overlay
+#| fig-cap: "Plate reference patterns over time; grey band = pooled Q25-Q75 across plates (drawn on top)."
+#| fig-width: 10
+#| fig-height: 6
+
+if (has_plotly) {
+  hover_ref <- merge(reference_pattern, plate_info[, c("plate_id", "plate_label")], by = "plate_id")
+  hover_ref$hover <- paste0("Plate: ", hover_ref$plate_id, "<br>", hover_ref$plate_label,
+                            "<br>time: ", hover_ref$time_value, "<br>value: ", round(hover_ref$center, 2))
+  o_int <- overlay_plot + ggplot2::geom_point(
+    data = hover_ref,
+    mapping = ggplot2::aes(x = .data$time_value, y = .data$center, text = .data$hover, group = .data$plate_id),
+    alpha = 0, size = 0.01, inherit.aes = FALSE
+  )
+  suppressWarnings(plotly::ggplotly(o_int, tooltip = "text"))
+} else {
+  overlay_plot
+}
+```
+
+## QC PDF
+
+Page 1: PCA ellipses; page 2: reference-pattern overlay; then, for each
+flagged plate, its vehicle-control well traces (`plot_raw_responses_pages()`,
+`level = "well"`, labels `VC(n_kept/n_total)`), alphabetical by plate label,
+to support the keep/exclude decision.
+
+```{r}
+#| label: qc-pdf
+
+qc_pdf <- out_path("qc", "pdf")
+flagged_ids <- decisions$plate_id[decisions$flagged]
+grDevices::pdf(qc_pdf, width = pdf_width, height = pdf_height)
+print(pca_plot)
+print(overlay_plot)
+n_decision_pages <- 0L
+if (length(flagged_ids) > 0) {
+  d_flag <- eligible[eligible$plate_id %in% flagged_ids, , drop = FALSE]
+  d_flag$plot_title <- plate_info$plate_label[match(d_flag$plate_id, plate_info$plate_id)]
+  lv <- plate_info[plate_info$plate_id %in% flagged_ids, , drop = FALSE]
+  lv <- lv[order(tolower(lv$plate_label), lv$plate_label, method = "radix"), , drop = FALSE]
+  d_flag$panel_key <- factor(d_flag$plate_id, levels = lv$plate_id)
+  wc <- count_wells_by_dose(
+    combined[combined$plate_id %in% flagged_ids, , drop = FALSE],
+    group_cols = c("plate_id", "is_vehicle_control", "concentration")
+  )
+  pages <- plot_raw_responses_pages(
+    d_flag, group_cols = "panel_key", segments = segments, level = "well",
+    wells = "vehicle_control", segment_style = segment_style,
+    response_label = p$response_label, well_counts = wc, title_col = "plot_title"
+  )
+  for (pg in pages) {
+    grid::grid.newpage()
+    grid::grid.draw(pg)
+  }
+  n_decision_pages <- length(pages)
+}
+invisible(grDevices::dev.off())
+n_pdf_pages <- 2L + n_decision_pages
+
+knitr::kable(data.frame(
+  pdf = qc_pdf, pages = n_pdf_pages,
+  flagged_plates_with_vc_pages = length(flagged_ids)
+), caption = "QC PDF written.")
+```
+
+## Status and outputs
+
+```{r}
+#| label: status
+
+if (length(unresolved) > 0) {
+  status <- "needs_review"
+  status_reason <- paste0(
+    length(unresolved), " flagged plate(s) need a decision: ", paste(sort(unresolved), collapse = ", "),
+    ". Inspect the QC plots and the plates' vehicle-control traces (QC PDF), then list each in ",
+    "`exclude_plates` or `keep_plates` with a reason, and re-render."
+  )
+} else {
+  status <- "complete"
+  status_reason <- paste0(
+    sum(decisions$flagged), " flagged plate(s) resolved; ", sum(decisions$excluded),
+    " plate(s) excluded, ", nrow(decisions) - sum(decisions$excluded), " kept."
+  )
+}
+```
+
+**Status: `r status`.** `r status_reason`
+
+```{r}
+#| label: save
+
+save_rds(reference_pattern, out_path("reference-pattern", "rds"))
+save_rds(pca, out_path("pca", "rds"))
+save_rds(list(ellipse_normal = out_normal, ellipse_t = out_t,
+             conf_level = conf_level, flag_method = flag_method),
+        out_path("outliers", "rds"))
+outputs <- c(out_path("reference-pattern", "rds"), out_path("pca", "rds"),
+             out_path("outliers", "rds"), qc_pdf)
+if (identical(status, "complete")) {
+  # Downstream-facing: written only once every flagged plate is decided.
+  save_rds(decisions, out_path("plate-decisions", "rds"))
+  outputs <- c(outputs, out_path("plate-decisions", "rds"))
+}
+
+to_entries <- function(tbl) lapply(seq_len(nrow(tbl)), function(i) as.list(tbl[i, c("plate_id", "reason")]))
+manifest <- list(
+  skill = skill,
+  run_label = p$run_label,
+  status = status,
+  status_reason = status_reason,
+  rendered_at = format(Sys.time(), "%Y-%m-%dT%H:%M:%S"),
+  zfbehavior_version = as.character(utils::packageVersion("zfbehavior")),
+  upstream = list(list(
+    run = as_chr(p$upstream),
+    manifest = file.path(as_chr(p$upstream), "outputs", basename(up_manifest_files)),
+    status = up$status
+  )),
+  inputs = list(list(
+    path = file.path(as_chr(p$upstream), combined_rel),
+    md5 = md5_now,
+    md5_matches_upstream_manifest = !md5_drift
+  )),
+  outputs = lapply(outputs, function(f) list(path = f, md5 = md5(f))),
+  cohort_note = p$cohort_note,
+  method = list(
+    reference = paste0(summary_type, " of kept vehicle-control wells per timepoint"),
+    pca = "prcomp(center = TRUE, scale. = TRUE), PC1/PC2",
+    flag_method = flag_method,
+    conf_level = conf_level,
+    cutoff_sq_mahalanobis = cutoff
+  ),
+  summary = list(
+    n_plates = nrow(decisions),
+    pc1_pct_var = round(pca$percent_var[["PC1"]], 4),
+    pc2_pct_var = round(pca$percent_var[["PC2"]], 4),
+    n_flagged_ellipse_normal = sum(decisions$outlier_normal),
+    n_flagged_ellipse_t = sum(decisions$outlier_t),
+    n_flagged = sum(decisions$flagged),
+    n_unresolved = length(unresolved),
+    n_excluded = sum(decisions$excluded),
+    n_qc_pdf_pages = n_pdf_pages
+  ),
+  flagged_plates = sort(decisions$plate_id[decisions$flagged]),
+  # Downstream skills drop exactly these plates (CONVENTIONS.md section 6).
+  excluded_plates = to_entries(exclude_tbl),
+  kept_flagged_plates = to_entries(keep_tbl[keep_tbl$plate_id %in% decisions$plate_id[decisions$flagged], , drop = FALSE]),
+  parameters = p[setdiff(names(p), c("exclude_plates", "keep_plates"))]
+)
+yaml::write_yaml(manifest, out_path("manifest", "yml"))
+
+knitr::kable(data.frame(output = c(outputs, out_path("manifest", "yml"))),
+             caption = "Files written by this run.")
+```

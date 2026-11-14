@@ -1,0 +1,64 @@
+# Parameters for one devtox-endpoints-bmc run.
+# Location: <project>/analysis/devtox-endpoints-bmc/<run_label>/devtox-endpoints-bmc.yml
+# Render:   quarto render devtox-endpoints-bmc.qmd --execute-params devtox-endpoints-bmc.yml
+#
+# Every value below is a scientific/study choice. Fill it in WITH the user;
+# never guess. Values marked REQUIRED have no default.
+
+# REQUIRED. Must equal this run folder's name (letters, digits, '-', '_').
+run_label: "CHANGE_ME"
+
+# Project root relative to this run folder.
+project_root: "../../.."
+
+# REQUIRED. Exactly one complete devtox-endpoints run folder (relative to the
+# project root).
+upstream:
+  - analysis/devtox-endpoints/CHANGE_ME
+
+# Which endpoint table to fit:
+#   per_plate - endpoints.rds, one BMC per plate (default)
+#   pooled    - endpoints-pooled.rds, one BMC per chemical (the upstream run
+#               must have used layout: by_chemical_pooled)
+table: per_plate
+
+# Where the BMR comes from:
+#   user     - `bmr` below is used directly (with `bmr_reason`)
+#   estimate - first render runs Rcurvep's knee-point BMR estimate and stops
+#              (needs_review); the user then fills in `bmr`/`bmr_reason`
+#              and re-renders (the saved sweep is reused)
+bmr_source: user
+
+# REQUIRED to calculate BMC: BMR in percent affected (Curvep TRSH), and why.
+# e.g. bmr: 30, bmr_reason: "BMR 30 used in phase 1 and phase 2"
+bmr: null
+bmr_reason: null
+
+# BMR estimate settings (bmr_source: estimate). Historical devtox script:
+# TRSH 5-95 by 5, 100 bootstrap samples.
+estimate_trsh_from: 5
+estimate_trsh_to: 95
+estimate_trsh_by: 5
+estimate_n_samples: 100
+
+# BMC settings. rnge 1000000 = increasing response (percent affected).
+rnge: 1000000
+n_samples: 1000
+seed: 2022
+
+# Parallel workers for Curvep (needs the `future` package); 1 = sequential.
+workers: 1
+
+# A curve is a hit when hit_confidence > hit_threshold; BMC labels are drawn
+# on hits only (every value stays in bmc-results.rds).
+hit_threshold: 0.5
+
+# Plot: panel titles (columns of the endpoint table joined with " | ";
+# empty = the panel key), title wrap width, panel order, page grid, PDF size.
+title_cols: []
+title_wrap_width: 40
+panel_order: alphabetical
+nrow: 1
+ncol: 5
+pdf_width: 15
+pdf_height: 5

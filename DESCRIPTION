@@ -1,0 +1,60 @@
+Package: zfbehavior
+Title: Zebrafish Larval Light-Dark Behavior and Developmental Toxicity
+    Analysis with Agent Skills
+Version: 0.1.0
+Authors@R: 
+    c(
+      person("Jui-Hua", "Hsieh", , "juihua.hsieh@gmail.com", role = c("aut", "cre"),
+             comment = c(ORCID = "0000-0003-1620-1571")),
+      person("Kathryn", "Konrad", role = "aut")
+    )
+Description: Analysis of zebrafish larval light-dark transition test
+    (LDTT) tracking data and developmental toxicity in five modules: data
+    import and consistency checks; raw-response visualization and
+    inter-plate vehicle-control quality control; endpoint calculation
+    (Total Distance, Distance Change, Distance Shift, Movement Similarity),
+    normalization and intra-plate vehicle-control quality control; ANOVA
+    and repeated-measures ANOVA hit calling; and Curvep-based benchmark
+    concentration (BMC) modeling of behavioral and developmental toxicity
+    endpoints. Ships Agent Skills that guide a coding agent or a person
+    through one recorded run per step with a rendered 'Quarto' report.
+    Methods follow Hsieh et al. (2019) <doi:10.1093/toxsci/kfy258>,
+    Konrad et al. (2026) <doi:10.1016/j.neuro.2025.103371> and Truong
+    et al. (2026) <doi:10.1016/j.neuro.2026.103504>.
+URL: https://github.com/moggces/zfbehavior
+BugReports: https://github.com/moggces/zfbehavior/issues
+Depends: 
+    R (>= 4.1.0)
+SystemRequirements: Quarto (>= 1.4) to render the Agent Skill reports
+License: MIT + file LICENSE
+Encoding: UTF-8
+Roxygen: list(markdown = TRUE)
+RoxygenNote: 8.0.0
+Suggests: 
+    knitr,
+    plotly,
+    reactable,
+    rmarkdown,
+    testthat (>= 3.0.0),
+    withr,
+    writexl,
+    yaml
+Config/testthat/edition: 3
+VignetteBuilder: knitr
+Imports: 
+    DescTools,
+    dplyr,
+    ggplot2,
+    gridExtra,
+    MASS,
+    multcomp,
+    nlme,
+    purrr,
+    RColorBrewer,
+    Rcurvep,
+    readr,
+    readxl,
+    rlang,
+    stringr,
+    tibble,
+    tidyr

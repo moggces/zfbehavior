@@ -1,0 +1,476 @@
+---
+title: "raw-response-plots"
+subtitle: "Raw behavioral response plots (dose-group summary + vehicle-control wells) and well-usage counts"
+format:
+  html:
+    toc: true
+    code-fold: true
+    embed-resources: true
+execute:
+  warning: true
+  message: false
+params:
+  # All values come from raw-response-plots.yml (--execute-params); defaults
+  # are null on purpose (nested-map defaults are not valid knitr params).
+  run_label: null
+  project_root: "../../.."
+  upstream: null
+  segments: null
+  segment_style: null
+  response_label: null
+  group_cols: null
+  title_cols: null
+  title_wrap_width: null
+  summary_type: null
+  missing_value_policy: null
+  wells: null
+  panel_order: null
+  pdf_width: null
+  pdf_height: null
+---
+
+<!--
+Template shipped with the zfbehavior package (inst/skills/raw-response-plots/).
+Do not edit the analysis code below for a specific study -- put every
+study-specific choice in raw-response-plots.yml and render with:
+
+  quarto render raw-response-plots.qmd --execute-params raw-response-plots.yml
+
+This document only calls exported zfbehavior functions. See
+inst/skills/CONVENTIONS.md for the run-folder / naming / manifest rules.
+-->
+
+```{r}
+#| label: setup
+#| include: false
+
+library(zfbehavior)
+
+p <- params
+skill <- "raw-response-plots"
+
+stop_param <- function(msg) {
+  stop("raw-response-plots parameter error: ", msg, call. = FALSE)
+}
+as_chr <- function(x) if (is.null(x)) character(0) else unlist(x, use.names = FALSE)
+or_default <- function(x, default) if (is.null(x) || length(x) == 0) default else x
+
+if (is.null(p$run_label) || !grepl("^[A-Za-z0-9_-]+$", p$run_label)) {
+  stop_param("`run_label` is required (letters, digits, '-', '_').")
+}
+if (length(as_chr(p$upstream)) != 1) {
+  stop_param("`upstream` must list exactly one dataset-import-qc run folder.")
+}
+if (is.null(p$segments) || length(p$segments) == 0) {
+  stop_param("`segments` is required (confirm the assay phase windows with the user).")
+}
+if (is.null(p$response_label) || !nzchar(p$response_label) || p$response_label == "CHANGE_ME") {
+  stop_param("`response_label` is required.")
+}
+summary_type <- or_default(p$summary_type, "median")
+missing_value_policy <- or_default(p$missing_value_policy, "impute_zero")
+wells <- or_default(p$wells, "vehicle_control")
+if (!summary_type %in% c("median", "mean")) stop_param("`summary_type` must be median or mean.")
+if (!missing_value_policy %in% c("impute_zero", "na_omit")) {
+  stop_param("`missing_value_policy` must be impute_zero or na_omit.")
+}
+if (!wells %in% c("vehicle_control", "all")) stop_param("`wells` must be vehicle_control or all.")
+panel_order <- or_default(p$panel_order, "alphabetical")
+if (!panel_order %in% c("alphabetical", "group_key")) {
+  stop_param("`panel_order` must be alphabetical or group_key.")
+}
+group_cols <- or_default(as_chr(p$group_cols), "plate_id")
+title_cols <- as_chr(p$title_cols)
+title_wrap_width <- as.numeric(or_default(p$title_wrap_width, 60))
+if (length(title_wrap_width) != 1 || is.na(title_wrap_width) || title_wrap_width < 1) {
+  stop_param("`title_wrap_width` must be a positive number (characters per title line).")
+}
+pdf_width <- as.numeric(or_default(p$pdf_width, 15))
+pdf_height <- as.numeric(or_default(p$pdf_height, 10))
+
+# Segments: name -> {from, to} (inclusive integer range).
+segments <- lapply(names(p$segments), function(nm) {
+  s <- p$segments[[nm]]
+  if (!is.list(s) || is.null(s$from) || is.null(s$to)) {
+    stop_param(paste0("segment `", nm, "` must be given as {from: <first>, to: <last>}."))
+  }
+  from <- as.numeric(s$from)
+  to <- as.numeric(s$to)
+  if (length(from) != 1 || length(to) != 1 || !is.finite(from) || !is.finite(to) || to < from) {
+    stop_param(paste0("segment `", nm, "` needs numeric from <= to."))
+  }
+  seq(from, to)
+})
+names(segments) <- names(p$segments)
+
+segment_style <- p$segment_style
+if (!is.null(segment_style)) {
+  unknown_style <- setdiff(names(segment_style), names(segments))
+  if (length(unknown_style) > 0) {
+    stop_param(paste0("`segment_style` names unknown segment(s): ", paste(unknown_style, collapse = ", ")))
+  }
+}
+
+project_root <- normalizePath(p$project_root, mustWork = TRUE)
+out_dir <- "outputs"
+dir.create(out_dir, showWarnings = FALSE)
+out_path <- function(object, ext) {
+  file.path(out_dir, paste0(skill, "__", p$run_label, "__", object, ".", ext))
+}
+# CONVENTIONS.md section 2: every table saved to outputs/ is a tibble,
+# including tables one level inside a saved list / result object.
+save_rds <- function(x, path) {
+  as_tbl <- function(v) if (is.data.frame(v) && !inherits(v, "tbl_df")) tibble::as_tibble(v) else v
+  x <- as_tbl(x)
+  if (is.list(x) && !is.data.frame(x)) {
+    cls <- class(x)
+    x[] <- lapply(x, as_tbl)
+    class(x) <- cls
+  }
+  saveRDS(x, path)
+}
+# A previous pass's manifest must not survive a failed re-render.
+if (file.exists(out_path("manifest", "yml"))) file.remove(out_path("manifest", "yml"))
+md5 <- function(f) unname(tools::md5sum(f))
+```
+
+## Run
+
+- Skill: `raw-response-plots`
+- Run label: **`r p$run_label`**
+- zfbehavior version: `r as.character(utils::packageVersion("zfbehavior"))`
+- Rendered: `r format(Sys.time(), "%Y-%m-%d %H:%M:%S")`
+
+## Upstream
+
+The upstream `dataset-import-qc` run must be `complete`. Its output holds only
+single-larva wells (`well_contract: single_larva_wells_only`), so the wells
+present are the denominators below; this skill does not re-curate wells.
+
+```{r}
+#| label: upstream
+
+upstream_dir <- file.path(project_root, as_chr(p$upstream))
+up_manifest_files <- list.files(file.path(upstream_dir, "outputs"),
+                                pattern = "__manifest\\.yml$", full.names = TRUE)
+if (length(up_manifest_files) != 1) {
+  stop("raw-response-plots: no unique manifest found in ", file.path(upstream_dir, "outputs"),
+       call. = FALSE)
+}
+up <- yaml::read_yaml(up_manifest_files)
+if (!identical(up$skill, "dataset-import-qc")) {
+  stop("raw-response-plots: upstream must be a dataset-import-qc run (found `", up$skill, "`).",
+       call. = FALSE)
+}
+if (!identical(up$status, "complete")) {
+  stop("raw-response-plots: upstream run `", as_chr(p$upstream), "` has status `", up$status,
+       "`, not `complete`. Resolve it first (", up$status_reason, ").", call. = FALSE)
+}
+if (!identical(up$well_contract, "single_larva_wells_only")) {
+  stop("raw-response-plots: upstream manifest does not declare `well_contract: ",
+       "single_larva_wells_only` (made by an older dataset-import-qc template?). ",
+       "Re-run dataset-import-qc with the current skill.", call. = FALSE)
+}
+
+up_outputs <- data.frame(
+  path = vapply(up$outputs, `[[`, "", "path"),
+  md5 = vapply(up$outputs, `[[`, "", "md5"),
+  stringsAsFactors = FALSE
+)
+combined_rel <- up_outputs$path[grepl("__combined\\.rds$", up_outputs$path)]
+if (length(combined_rel) != 1) {
+  stop("raw-response-plots: upstream manifest lists no combined.rds output.", call. = FALSE)
+}
+combined_file <- file.path(upstream_dir, combined_rel)
+md5_now <- md5(combined_file)
+md5_drift <- !identical(md5_now, up_outputs$md5[up_outputs$path == combined_rel])
+if (md5_drift) {
+  warning("Upstream combined.rds md5 differs from its manifest: the upstream run was ",
+          "modified after it completed. Confirm with the user before using these plots.",
+          call. = FALSE)
+}
+
+knitr::kable(data.frame(
+  upstream = as_chr(p$upstream),
+  status = up$status,
+  well_contract = up$well_contract,
+  rendered_at = up$rendered_at,
+  md5_matches_manifest = !md5_drift
+), caption = "Upstream run.")
+```
+
+```{r}
+#| label: load
+
+combined <- readRDS(combined_file)
+
+missing_cols <- setdiff(c(raw_plot_input_cols(), group_cols, title_cols), names(combined))
+if (length(missing_cols) > 0) {
+  stop_param(paste0("column(s) not in the upstream data: ", paste(missing_cols, collapse = ", ")))
+}
+
+times <- sort(unique(combined$time_value))
+seg_times <- unlist(segments, use.names = FALSE)
+not_in_data <- setdiff(seg_times, times)
+if (length(not_in_data) > 0) {
+  stop_param(paste0("segment time_value(s) not present in the data: ",
+                    paste(utils::head(not_in_data, 10), collapse = ", ")))
+}
+overlap <- seg_times[duplicated(seg_times)]
+if (length(overlap) > 0) {
+  stop_param(paste0("segments overlap at time_value(s): ", paste(unique(overlap), collapse = ", ")))
+}
+
+wells_tbl <- unique(combined[, c("plate_id", "well_id", "keep_well")])
+knitr::kable(data.frame(
+  rows = nrow(combined),
+  plates = length(unique(combined$plate_id)),
+  wells = nrow(wells_tbl),
+  wells_keep_well_TRUE = sum(wells_tbl$keep_well),
+  wells_keep_well_FALSE = sum(!wells_tbl$keep_well),
+  timepoints = length(times),
+  time_range = paste(range(times), collapse = "-")
+), caption = "Input (upstream combined dataset).")
+
+knitr::kable(data.frame(
+  segment = names(segments),
+  from = vapply(segments, min, 1),
+  to = vapply(segments, max, 1),
+  n_timepoints = lengths(segments)
+), row.names = FALSE, caption = "Segments (shading only).")
+```
+
+## Well usage per dose group
+
+`count_wells_by_dose()` on the full upstream data (before the `keep_well`
+filter): `n_kept_wells` = wells with `keep_well == TRUE`, `n_total_wells` =
+all wells present. Because the upstream run guarantees single-larva wells,
+`n_total_wells` is the number of larvae assayed. These counts label every
+dose group in the plots as `(n_kept/n_total)`.
+
+```{r}
+#| label: well-counts
+
+well_counts <- count_wells_by_dose(
+  combined,
+  group_cols = c("plate_id", "is_vehicle_control", "concentration")
+)
+save_rds(well_counts, out_path("well-counts", "rds"))
+
+id_cols <- unique(c("plate_id", setdiff(title_cols, "plate_id")))
+plate_ids <- unique(combined[, id_cols, drop = FALSE])
+if (anyDuplicated(plate_ids$plate_id)) {
+  plate_ids <- unique(combined[, "plate_id", drop = FALSE])
+}
+
+vc_usage <- well_counts[well_counts$is_vehicle_control, , drop = FALSE]
+vc_usage$pct_used <- vc_usage$n_kept_wells / vc_usage$n_total_wells * 100
+vc_usage <- merge(plate_ids, vc_usage[, c("plate_id", "n_kept_wells", "n_total_wells", "pct_used")],
+                  by = "plate_id", all.y = TRUE)
+vc_usage <- vc_usage[order(vc_usage$pct_used, vc_usage$plate_id), , drop = FALSE]
+save_rds(vc_usage, out_path("vc-usage", "rds"))
+
+knitr::kable(data.frame(
+  plates = nrow(vc_usage),
+  plates_100pct = sum(vc_usage$pct_used == 100),
+  plates_below_90pct = sum(vc_usage$pct_used < 90),
+  plates_below_80pct = sum(vc_usage$pct_used < 80),
+  min_pct = round(min(vc_usage$pct_used), 1),
+  median_pct = round(stats::median(vc_usage$pct_used), 1),
+  vc_groups_by_n_total = paste(
+    paste0(names(table(vc_usage$n_total_wells)), " wells: ", table(vc_usage$n_total_wells), " plate(s)"),
+    collapse = "; "
+  )
+), caption = "Vehicle-control well usage (n_kept / n_total) across plates.")
+```
+
+```{r}
+#| label: tbl-vc-usage
+#| tbl-cap: "Vehicle-control well usage per plate, lowest first."
+
+vc_show <- vc_usage
+vc_show$pct_used <- round(vc_show$pct_used, 1)
+if (requireNamespace("reactable", quietly = TRUE)) {
+  reactable::reactable(vc_show, filterable = TRUE, searchable = TRUE, sortable = TRUE,
+                       defaultPageSize = 15, striped = TRUE, compact = TRUE)
+} else {
+  knitr::kable(utils::head(vc_show, 30), row.names = FALSE)
+}
+```
+
+## Raw response plots
+
+Only `keep_well == TRUE` wells are plotted. One panel per
+`r paste(group_cols, collapse = " x ")` group, in `r panel_order` order; default page grids are 3 x 2
+(summary) and 2 x 2 (well level).
+
+```{r}
+#| label: plot-input
+
+eligible <- combined[combined$keep_well, , drop = FALSE]
+title_col <- NULL
+if (length(title_cols) > 0) {
+  eligible$plot_title <- do.call(paste, c(lapply(title_cols, function(cc) eligible[[cc]]), sep = "@"))
+  n_titles <- tapply(eligible$plot_title,
+                     do.call(paste, c(lapply(group_cols, function(cc) eligible[[cc]]), sep = "@")),
+                     function(x) length(unique(x)))
+  if (any(n_titles > 1)) {
+    stop_param("`title_cols` are not constant within each `group_cols` group.")
+  }
+  title_col <- "plot_title"
+}
+
+# Panel order: plot_raw_responses_pages() pages panels in the level order of
+# its grouping column, so group by an internal factor `panel_key` (same text
+# as the group key) whose levels are sorted as requested. plate_id itself is
+# untouched (well-count join, plate-safe well identity).
+eligible$panel_key <- do.call(paste, c(lapply(group_cols, function(cc) as.character(eligible[[cc]])), sep = "@"))
+panels <- unique(data.frame(
+  panel_key = eligible$panel_key,
+  sort_text = if (is.null(title_col)) eligible$panel_key else eligible$plot_title,
+  stringsAsFactors = FALSE
+))
+if (panel_order == "alphabetical") {
+  # Case-insensitive, ties by the exact text; radix = locale-independent.
+  panels <- panels[order(tolower(panels$sort_text), panels$sort_text, method = "radix"), , drop = FALSE]
+} else {
+  panels <- panels[order(panels$panel_key, method = "radix"), , drop = FALSE]
+}
+eligible$panel_key <- factor(eligible$panel_key, levels = panels$panel_key)
+n_groups <- nrow(panels)
+```
+
+Panel order: **`r panel_order`**
+(`r if (panel_order == "alphabetical") "case-insensitive alphabetical by panel title" else "by group key"`).
+
+```{r}
+#| label: plot-summary
+
+t0 <- Sys.time()
+summary_pages <- plot_raw_responses_pages(
+  eligible,
+  group_cols = "panel_key",
+  segments = segments,
+  level = "summary",
+  summary_type = summary_type,
+  missing_value_policy = missing_value_policy,
+  segment_style = segment_style,
+  response_label = p$response_label,
+  well_counts = well_counts,
+  title_col = title_col,
+  title_wrap_width = title_wrap_width
+)
+summary_pdf <- out_path("summary", "pdf")
+ggplot2::ggsave(summary_pdf, summary_pages, width = pdf_width, height = pdf_height)
+summary_secs <- as.numeric(difftime(Sys.time(), t0, units = "secs"))
+```
+
+```{r}
+#| label: plot-well
+
+t0 <- Sys.time()
+well_pages <- plot_raw_responses_pages(
+  eligible,
+  group_cols = "panel_key",
+  segments = segments,
+  level = "well",
+  missing_value_policy = missing_value_policy,
+  segment_style = segment_style,
+  wells = wells,
+  response_label = p$response_label,
+  well_counts = well_counts,
+  title_col = title_col,
+  title_wrap_width = title_wrap_width
+)
+well_pdf <- out_path("well", "pdf")
+ggplot2::ggsave(well_pdf, well_pages, width = pdf_width, height = pdf_height)
+well_secs <- as.numeric(difftime(Sys.time(), t0, units = "secs"))
+
+knitr::kable(data.frame(
+  pdf = c(summary_pdf, well_pdf),
+  level = c("summary (dose groups)", paste0("well (", wells, ")")),
+  panels = n_groups,
+  pages = c(length(summary_pages), length(well_pages)),
+  seconds = round(c(summary_secs, well_secs), 1)
+), row.names = FALSE, caption = "Raw-response PDFs written.")
+```
+
+First page of each PDF (all pages are in the PDFs):
+
+```{r}
+#| label: fig-preview-summary
+#| fig-width: 15
+#| fig-height: 10
+#| fig-cap: "Summary PDF, page 1."
+
+grid::grid.newpage()
+grid::grid.draw(summary_pages[[1]])
+```
+
+```{r}
+#| label: fig-preview-well
+#| fig-width: 15
+#| fig-height: 10
+#| fig-cap: "Well-level PDF, page 1."
+
+grid::grid.newpage()
+grid::grid.draw(well_pages[[1]])
+```
+
+## Status and outputs
+
+Plots carry no automatic pass/fail: the run is `complete` once all outputs
+are written. Inspect the PDFs before relying on downstream results.
+
+```{r}
+#| label: save
+
+status <- "complete"
+status_reason <- paste0(
+  n_groups, " panel(s); summary PDF ", length(summary_pages), " page(s), well PDF ",
+  length(well_pages), " page(s). Visual inspection of the PDFs is advised."
+)
+
+outputs <- c(out_path("well-counts", "rds"), out_path("vc-usage", "rds"), summary_pdf, well_pdf)
+manifest <- list(
+  skill = skill,
+  run_label = p$run_label,
+  status = status,
+  status_reason = status_reason,
+  rendered_at = format(Sys.time(), "%Y-%m-%dT%H:%M:%S"),
+  zfbehavior_version = as.character(utils::packageVersion("zfbehavior")),
+  upstream = list(list(
+    run = as_chr(p$upstream),
+    manifest = file.path(as_chr(p$upstream), "outputs", basename(up_manifest_files)),
+    status = up$status
+  )),
+  inputs = list(list(
+    path = file.path(as_chr(p$upstream), combined_rel),
+    md5 = md5_now,
+    md5_matches_upstream_manifest = !md5_drift
+  )),
+  outputs = lapply(outputs, function(f) list(path = f, md5 = md5(f))),
+  summary = list(
+    n_rows = nrow(combined),
+    n_plates = length(unique(combined$plate_id)),
+    n_wells = nrow(wells_tbl),
+    n_wells_plotted = sum(wells_tbl$keep_well),
+    n_panels = n_groups,
+    n_pages_summary = length(summary_pages),
+    n_pages_well = length(well_pages),
+    vc_usage_min_pct = round(min(vc_usage$pct_used), 2),
+    vc_usage_median_pct = round(stats::median(vc_usage$pct_used), 2)
+  ),
+  parameters = p
+)
+yaml::write_yaml(manifest, out_path("manifest", "yml"))
+```
+
+**Status: `r status`.** `r status_reason`
+
+```{r}
+#| label: outputs-table
+
+knitr::kable(data.frame(output = c(outputs, out_path("manifest", "yml"))),
+             caption = "Files written by this run.")
+```

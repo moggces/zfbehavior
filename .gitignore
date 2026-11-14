@@ -1,0 +1,40 @@
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+*.Rproj
+inst/doc
+.Rbuildignore~
+/renv/
+renv/library
+renv/staging
+renv/python
+renv/local
+
+# Windows NTFS alternate-data-stream metadata (e.g. from downloaded files)
+*:Zone.Identifier
+*:sec.endpointdlp
+
+# Stray R graphics-device artifact created by running interactive R
+# snippets (e.g. example/demo plot building) or tests that call
+# ggplot2::ggplot_build() with no active graphics device open -- R
+# silently opens a default pdf(NULL) device and dumps to Rplots.pdf in
+# the current working directory. Can appear at the repo root or in
+# tests/testthat/ depending on where the R session's working directory
+# was set.
+Rplots.pdf
+
+# Local real-data folders (see AGENTS.local.md); never committed.
+full_dataset_validation/
+/doc/
+/Meta/
+
+# Local agent scratch files.
+/.opencode/
+
+/skill_validation/
+
+# Maintainer's private setup and the nested private repo (see AGENTS.local.md)
+/AGENTS.local.md
+/opencode.json
+/private/

@@ -1,0 +1,15 @@
+^LICENSE\.md$
+^AGENTS\.md$
+^full_dataset_validation$
+^\.github$
+^renv$
+^renv\.lock$
+^doc$
+^Meta$
+^\.opencode$
+^skill_validation$
+^README\.md$
+^private$
+^AGENTS\.local\.md$
+^opencode\.json$
+^CONTRIBUTING\.md$

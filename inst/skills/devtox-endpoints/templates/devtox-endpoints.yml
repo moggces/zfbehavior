@@ -1,0 +1,50 @@
+# Parameters for one devtox-endpoints run.
+# Location: <project>/analysis/devtox-endpoints/<run_label>/devtox-endpoints.yml
+# Render:   quarto render devtox-endpoints.qmd --execute-params devtox-endpoints.yml
+#
+# Every value below is a scientific/study choice. Fill it in WITH the user;
+# never guess. Values marked REQUIRED have no default.
+
+# REQUIRED. Must equal this run folder's name (letters, digits, '-', '_').
+run_label: "CHANGE_ME"
+
+# Project root relative to this run folder (analysis/devtox-endpoints/<run>/).
+project_root: "../../.."
+
+# REQUIRED. Exactly one complete dataset-import-qc run folder (relative to the
+# project root), plus zero or more complete QC runs of that same import whose
+# `excluded_plates` are dropped (e.g. analysis/interplate-vc-qc/<run>).
+upstream:
+  - analysis/dataset-import-qc/CHANGE_ME
+
+# Plot layout (endpoints are always also saved per plate):
+#   per_plate          - one panel per plate (default)
+#   by_chemical_plates - one panel per chemical, one line per plate
+#   by_chemical_pooled - one panel per chemical, one line; counts of the
+#                        plates are summed per concentration (also saves
+#                        endpoints-pooled.rds)
+layout: per_plate
+
+# Column identifying "the same chemical" across plates (by_chemical_* layouts
+# only), e.g. DTXSID; use another column (e.g. CHEMICAL_NAME) if DTXSID is
+# missing for some wells. Must have no missing values.
+chemical_col: DTXSID
+
+# Panel title: these columns joined with " | ", constant within a panel.
+# Empty = plate_id (per_plate) or chemical_col (by_chemical_*).
+# e.g. per_plate: [CHEMICAL_NAME, chemical_id, plate_id]
+#      by_chemical_*: [CHEMICAL_NAME, DTXSID]
+title_cols: []
+
+# Long panel titles wrap onto several lines at this many characters
+# (panels are narrow: ~3 inches at 5 per 15-inch page).
+title_wrap_width: 40
+
+# Panel order: alphabetical (by panel title, case-insensitive) | group_key.
+panel_order: alphabetical
+
+# Panels per page (rows x columns) and PDF page size in inches.
+nrow: 1
+ncol: 5
+pdf_width: 15
+pdf_height: 5

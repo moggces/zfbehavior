@@ -1,0 +1,496 @@
+---
+title: "devtox-endpoints"
+subtitle: "Developmental toxicity endpoint (percent of affected larvae) per dose group, with dose-response plots"
+format:
+  html:
+    toc: true
+    code-fold: true
+    embed-resources: true
+execute:
+  warning: true
+  message: false
+params:
+  # All values come from devtox-endpoints.yml (--execute-params); defaults
+  # are null on purpose (nested-map defaults are not valid knitr params).
+  run_label: null
+  project_root: "../../.."
+  upstream: null
+  layout: null
+  chemical_col: null
+  title_cols: null
+  title_wrap_width: null
+  panel_order: null
+  nrow: null
+  ncol: null
+  pdf_width: null
+  pdf_height: null
+---
+
+<!--
+Template shipped with the zfbehavior package (inst/skills/devtox-endpoints/).
+Do not edit the analysis code below for a specific study -- put every
+study-specific choice in devtox-endpoints.yml and render with:
+
+  quarto render devtox-endpoints.qmd --execute-params devtox-endpoints.yml
+
+This document only calls exported zfbehavior functions. See
+inst/skills/CONVENTIONS.md for the run-folder / naming / manifest rules.
+-->
+
+```{r}
+#| label: setup
+#| include: false
+
+library(zfbehavior)
+
+p <- params
+skill <- "devtox-endpoints"
+
+stop_param <- function(msg) {
+  stop("devtox-endpoints parameter error: ", msg, call. = FALSE)
+}
+as_chr <- function(x) if (is.null(x)) character(0) else unlist(x, use.names = FALSE)
+or_default <- function(x, default) if (is.null(x) || length(x) == 0) default else x
+pos_int <- function(x, what) {
+  x <- suppressWarnings(as.numeric(x))
+  if (length(x) != 1 || !is.finite(x) || x < 1 || x != round(x)) {
+    stop_param(paste0("`", what, "` must be a positive integer."))
+  }
+  as.integer(x)
+}
+
+if (is.null(p$run_label) || !grepl("^[A-Za-z0-9_-]+$", p$run_label)) {
+  stop_param("`run_label` is required (letters, digits, '-', '_').")
+}
+upstream_runs <- sub("/+$", "", as_chr(p$upstream))
+if (length(upstream_runs) == 0) {
+  stop_param("`upstream` must list one dataset-import-qc run (plus optional QC runs).")
+}
+layout <- or_default(p$layout, "per_plate")
+if (!layout %in% c("per_plate", "by_chemical_plates", "by_chemical_pooled")) {
+  stop_param("`layout` must be per_plate, by_chemical_plates or by_chemical_pooled.")
+}
+chemical_col <- or_default(as_chr(p$chemical_col), "DTXSID")
+if (length(chemical_col) != 1) stop_param("`chemical_col` must be one column name.")
+title_cols <- as_chr(p$title_cols)
+title_wrap_width <- as.numeric(or_default(p$title_wrap_width, 40))
+if (length(title_wrap_width) != 1 || is.na(title_wrap_width) || title_wrap_width < 1) {
+  stop_param("`title_wrap_width` must be a positive number (characters per title line).")
+}
+panel_order <- or_default(p$panel_order, "alphabetical")
+if (!panel_order %in% c("alphabetical", "group_key")) {
+  stop_param("`panel_order` must be alphabetical or group_key.")
+}
+n_row <- pos_int(or_default(p$nrow, 1), "nrow")
+n_col <- pos_int(or_default(p$ncol, 5), "ncol")
+pdf_width <- as.numeric(or_default(p$pdf_width, 15))
+pdf_height <- as.numeric(or_default(p$pdf_height, 5))
+
+project_root <- normalizePath(p$project_root, mustWork = TRUE)
+out_dir <- "outputs"
+dir.create(out_dir, showWarnings = FALSE)
+out_path <- function(object, ext) {
+  file.path(out_dir, paste0(skill, "__", p$run_label, "__", object, ".", ext))
+}
+# CONVENTIONS.md section 2: every table saved to outputs/ is a tibble,
+# including tables one level inside a saved list / result object.
+save_rds <- function(x, path) {
+  as_tbl <- function(v) if (is.data.frame(v) && !inherits(v, "tbl_df")) tibble::as_tibble(v) else v
+  x <- as_tbl(x)
+  if (is.list(x) && !is.data.frame(x)) {
+    cls <- class(x)
+    x[] <- lapply(x, as_tbl)
+    class(x) <- cls
+  }
+  saveRDS(x, path)
+}
+# Outputs of a previous pass must not survive a failed re-render.
+for (f in list.files(out_dir, pattern = paste0("^", skill, "__", p$run_label, "__"), full.names = TRUE)) {
+  file.remove(f)
+}
+md5 <- function(f) unname(tools::md5sum(f))
+
+has_reactable <- requireNamespace("reactable", quietly = TRUE)
+show_table <- function(df, page_size = 15) {
+  if (has_reactable) {
+    reactable::reactable(df, filterable = TRUE, searchable = TRUE, sortable = TRUE,
+                         defaultPageSize = page_size, striped = TRUE, compact = TRUE)
+  } else {
+    knitr::kable(df, row.names = FALSE)
+  }
+}
+```
+
+## Run
+
+- Skill: `devtox-endpoints`
+- Run label: **`r p$run_label`**
+- Layout: **`r layout`**`r if (layout != "per_plate") paste0(" (chemical column: ", chemical_col, ")") else ""`
+- zfbehavior version: `r as.character(utils::packageVersion("zfbehavior"))`
+- Rendered: `r format(Sys.time(), "%Y-%m-%d %H:%M:%S")`
+
+## Upstream
+
+Exactly one `complete` `dataset-import-qc` run (single-larva wells only:
+`keep_well = FALSE` means the one larva was dead or malformed), plus optional
+`complete` QC runs of that same import whose `excluded_plates` are dropped
+(`CONVENTIONS.md`, section 6).
+
+```{r}
+#| label: upstream
+
+read_manifest <- function(run) {
+  dir <- file.path(project_root, run)
+  f <- list.files(file.path(dir, "outputs"), pattern = "__manifest\\.yml$", full.names = TRUE)
+  if (length(f) != 1) {
+    stop("devtox-endpoints: no unique manifest found in ", file.path(dir, "outputs"), call. = FALSE)
+  }
+  m <- yaml::read_yaml(f)
+  if (!identical(m$status, "complete")) {
+    stop("devtox-endpoints: upstream run `", run, "` has status `", m$status,
+         "`, not `complete`. Resolve it first (", m$status_reason, ").", call. = FALSE)
+  }
+  m$.run <- run
+  m$.manifest_file <- f
+  m
+}
+ups <- lapply(upstream_runs, read_manifest)
+up_skills <- vapply(ups, function(m) as.character(m$skill), "")
+if (sum(up_skills == "dataset-import-qc") != 1) {
+  stop_param("`upstream` must list exactly one dataset-import-qc run.")
+}
+imp <- ups[[which(up_skills == "dataset-import-qc")]]
+qc_runs <- ups[up_skills != "dataset-import-qc"]
+if (!identical(imp$well_contract, "single_larva_wells_only")) {
+  stop("devtox-endpoints: the import manifest does not declare `well_contract: ",
+       "single_larva_wells_only` (older dataset-import-qc template?). ",
+       "Re-run dataset-import-qc with the current skill.", call. = FALSE)
+}
+for (m in qc_runs) {
+  qc_up <- vapply(m$upstream, function(u) sub("/+$", "", as.character(u$run)), "")
+  if (!imp$.run %in% qc_up) {
+    stop("devtox-endpoints: QC run `", m$.run, "` (", m$skill, ") was made on ",
+         paste(qc_up, collapse = ", "), ", not on the import run `", imp$.run, "`.", call. = FALSE)
+  }
+}
+
+imp_outputs <- data.frame(
+  path = vapply(imp$outputs, `[[`, "", "path"),
+  md5 = vapply(imp$outputs, `[[`, "", "md5"),
+  stringsAsFactors = FALSE
+)
+combined_rel <- imp_outputs$path[grepl("__combined\\.rds$", imp_outputs$path)]
+if (length(combined_rel) != 1) {
+  stop("devtox-endpoints: import manifest lists no combined.rds output.", call. = FALSE)
+}
+combined_file <- file.path(project_root, imp$.run, combined_rel)
+md5_now <- md5(combined_file)
+md5_drift <- !identical(md5_now, imp_outputs$md5[imp_outputs$path == combined_rel])
+if (md5_drift) {
+  warning("Upstream combined.rds md5 differs from its manifest: the import run was ",
+          "modified after it completed. Confirm with the user before using these results.",
+          call. = FALSE)
+}
+
+knitr::kable(data.frame(
+  upstream = vapply(ups, `[[`, "", ".run"),
+  skill = up_skills,
+  status = vapply(ups, function(m) as.character(m$status), ""),
+  excluded_plates = vapply(ups, function(m) length(m$excluded_plates), 1L),
+  rendered_at = vapply(ups, function(m) as.character(m$rendered_at), "")
+), caption = paste0("Upstream runs. combined.rds md5 matches its manifest: ", !md5_drift, "."))
+```
+
+```{r}
+#| label: load
+
+combined <- readRDS(combined_file)
+
+# Plates excluded by QC runs (the import's own exclusions are already absent).
+qc_excl <- do.call(rbind, c(
+  list(data.frame(plate_id = character(0), reason = character(0), qc_run = character(0))),
+  lapply(qc_runs, function(m) {
+    if (length(m$excluded_plates) == 0) return(NULL)
+    data.frame(
+      plate_id = vapply(m$excluded_plates, function(e) as.character(e$plate_id), ""),
+      reason = vapply(m$excluded_plates, function(e) as.character(e$reason), ""),
+      qc_run = m$.run, stringsAsFactors = FALSE
+    )
+  })
+))
+unknown_excl <- setdiff(qc_excl$plate_id, combined$plate_id)
+if (length(unknown_excl) > 0) {
+  stop("devtox-endpoints: QC-excluded plate(s) not in the import data: ",
+       paste(unknown_excl, collapse = ", "), call. = FALSE)
+}
+d <- combined[!combined$plate_id %in% qc_excl$plate_id, , drop = FALSE]
+
+by_chem <- layout != "per_plate"
+id_cols <- unique(c("plate_id", if (by_chem) chemical_col, title_cols))
+missing_cols <- setdiff(c(devtox_input_cols(), id_cols), names(d))
+if (length(missing_cols) > 0) {
+  stop_param(paste0("column(s) not in the upstream data: ", paste(missing_cols, collapse = ", ")))
+}
+na_cols <- id_cols[vapply(id_cols, function(cc) anyNA(d[[cc]]), TRUE)]
+if (length(na_cols) > 0) {
+  stop_param(paste0("column(s) with missing values cannot identify plates/chemicals: ",
+                    paste(na_cols, collapse = ", "),
+                    if (chemical_col %in% na_cols) " (choose another `chemical_col`, e.g. CHEMICAL_NAME)" else ""))
+}
+plate_info <- unique(as.data.frame(d)[, id_cols, drop = FALSE])
+if (anyDuplicated(plate_info$plate_id)) {
+  stop_param(paste0("column(s) not constant within a plate: ",
+                    paste(id_cols[-1], collapse = ", "), "."))
+}
+
+knitr::kable(data.frame(
+  plates_in_import = length(unique(combined$plate_id)),
+  plates_excluded_by_qc = length(unique(qc_excl$plate_id)),
+  plates_used = nrow(plate_info),
+  wells_used = nrow(unique(d[, c("plate_id", "well_id")])),
+  keep_well_false = nrow(unique(d[!d$keep_well, c("plate_id", "well_id")]))
+), caption = "Data used (one row per well; keep_well = FALSE = one larva, dead or malformed).")
+if (nrow(qc_excl) > 0) {
+  knitr::kable(qc_excl, row.names = FALSE, caption = "Plates excluded by upstream QC runs.")
+}
+```
+
+## Endpoints
+
+`endpoints.rds` (always) has one row per plate x dose group;
+`endpoints-pooled.rds` (pooled layout only) has one row per chemical x dose
+group, with `N` and `n_affected` summed over the chemical's plates tested at
+that concentration.
+
+`calculate_devtox_endpoints()` counts, per plate and dose group (vehicle
+control included), the larvae `N` (wells present) and the affected larvae
+`n_affected` (`keep_well = FALSE`); `pct_affected = 100 * n_affected / N`.
+`r if (layout == "by_chemical_pooled") paste0("For the pooled layout the same function is also run per ", chemical_col, ": wells of all plates of a chemical are counted together per concentration.") else ""`
+
+```{r}
+#| label: endpoints
+
+endpoints <- calculate_devtox_endpoints(d, group_cols = id_cols)
+
+pooled <- NULL
+if (layout == "by_chemical_pooled") {
+  chem_info <- unique(plate_info[, unique(c(chemical_col, title_cols)), drop = FALSE])
+  if (anyDuplicated(chem_info[[chemical_col]])) {
+    stop_param(paste0("`title_cols` must be constant within each ", chemical_col,
+                      " for the pooled layout."))
+  }
+  pooled <- tryCatch(
+    calculate_devtox_endpoints(d, group_cols = unique(c(chemical_col, title_cols))),
+    zfbehavior_error_mixed_concentration_units = function(e) {
+      stop_param(paste0("a chemical's plates use different concentration units, so they ",
+                        "cannot be pooled: ", conditionMessage(e)))
+    }
+  )
+}
+
+has_unit <- "concentration_unit" %in% names(endpoints)
+if (by_chem && has_unit) {
+  u <- unique(endpoints[!endpoints$is_vehicle_control, c(chemical_col, "concentration_unit")])
+  mixed_chem <- unique(u[[chemical_col]][duplicated(u[[chemical_col]])])
+  if (length(mixed_chem) > 0) {
+    stop_param(paste0("chemical(s) tested in different concentration units on different plates ",
+                      "cannot share one concentration axis: ", paste(mixed_chem, collapse = ", "),
+                      ". Use layout: per_plate."))
+  }
+}
+
+treated <- endpoints[!endpoints$is_vehicle_control, , drop = FALSE]
+knitr::kable(data.frame(
+  plates = length(unique(endpoints$plate_id)),
+  dose_groups = nrow(endpoints),
+  treated_dose_groups = nrow(treated),
+  N_min = min(endpoints$N),
+  N_median = stats::median(endpoints$N),
+  N_max = max(endpoints$N),
+  dose_groups_any_affected = sum(endpoints$n_affected > 0),
+  pooled_dose_groups = if (is.null(pooled)) NA_integer_ else nrow(pooled)
+), caption = "Endpoint summary (per plate).")
+```
+
+```{r}
+#| label: units
+
+if (has_unit) {
+  pu <- unique(treated[, c("plate_id", "concentration_unit")])
+  knitr::kable(as.data.frame(table(concentration_unit = pu$concentration_unit), responseName = "n_plates"),
+               caption = "Concentration units of treated wells (plates per unit).")
+} else {
+  cat("No concentration_unit column: concentrations are shown without units.\n")
+}
+```
+
+### Vehicle control: percent affected per plate
+
+Affected vehicle-control larvae are background. They are not used in the
+endpoint calculation of treated dose groups, but a high value questions the
+plate.
+
+```{r}
+#| label: tbl-vc-affected
+
+vc <- endpoints[endpoints$is_vehicle_control, , drop = FALSE]
+vc_tbl <- data.frame(plate_id = vc$plate_id, N = vc$N, n_affected = vc$n_affected,
+                     pct_affected = round(vc$pct_affected, 1), stringsAsFactors = FALSE)
+vc_tbl <- merge(plate_info, vc_tbl, by = "plate_id")
+vc_tbl <- vc_tbl[order(-vc_tbl$pct_affected, vc_tbl$plate_id), , drop = FALSE]
+knitr::kable(data.frame(
+  plates = nrow(vc_tbl),
+  median_pct = stats::median(vc_tbl$pct_affected),
+  max_pct = max(vc_tbl$pct_affected),
+  plates_any_affected = sum(vc_tbl$n_affected > 0)
+), caption = "Percent affected among vehicle-control larvae.")
+show_table(vc_tbl, page_size = 10)
+```
+
+### All dose groups
+
+```{r}
+#| label: tbl-endpoints
+
+tbl <- as.data.frame(endpoints)
+tbl$pct_affected <- round(tbl$pct_affected, 1)
+show_table(tbl[, setdiff(names(tbl), "endpoint"), drop = FALSE])
+```
+
+## Dose-response plots
+
+`plot_devtox_dose_response_pages()`: percent affected (0-100) per dose group,
+vehicle control labeled `VC`, `r n_row` x `r n_col` panels per page, panels in
+`r panel_order` order. No BMC results are shown; the `devtox-endpoints-bmc`
+skill draws a new PDF with them.
+
+```{r}
+#| label: plots
+
+plot_data <- switch(
+  layout,
+  per_plate = endpoints,
+  by_chemical_plates = endpoints,
+  by_chemical_pooled = pooled
+)
+key_col <- if (layout == "per_plate") "plate_id" else chemical_col
+default_title <- key_col
+tcols <- if (length(title_cols) > 0) title_cols else default_title
+plot_data$plot_title <- do.call(paste, c(lapply(tcols, function(cc) as.character(plot_data[[cc]])), sep = " | "))
+titles <- unique(as.data.frame(plot_data)[, c(key_col, "plot_title")])
+if (anyDuplicated(titles[[key_col]])) {
+  stop_param(paste0("`title_cols` must be constant within each panel (", key_col, ")."))
+}
+key_levels <- if (panel_order == "alphabetical") {
+  titles[[key_col]][order(tolower(titles$plot_title), titles$plot_title, method = "radix")]
+} else {
+  sort(as.character(titles[[key_col]]))
+}
+plot_data$panel_key <- factor(as.character(plot_data[[key_col]]), levels = as.character(key_levels))
+
+pages <- plot_devtox_dose_response_pages(
+  plot_data,
+  group_cols = "panel_key",
+  line_col = if (layout == "by_chemical_plates") "plate_id" else NULL,
+  title_col = "plot_title",
+  title_wrap_width = title_wrap_width,
+  nrow = n_row,
+  ncol = n_col
+)
+pdf_file <- out_path("dose-response", "pdf")
+grDevices::pdf(pdf_file, width = pdf_width, height = pdf_height)
+for (pg in pages) {
+  grid::grid.newpage()
+  grid::grid.draw(pg)
+}
+invisible(grDevices::dev.off())
+
+knitr::kable(data.frame(pdf = pdf_file, panels = length(key_levels), pages = length(pages)),
+             caption = "Dose-response PDF written.")
+```
+
+```{r}
+#| label: fig-first-page
+#| fig-cap: "First page of the dose-response PDF."
+#| fig-width: !expr pdf_width
+#| fig-height: !expr pdf_height
+
+grid::grid.newpage()
+grid::grid.draw(pages[[1]])
+```
+
+## Status and outputs
+
+```{r}
+#| label: save
+
+status <- "complete"
+status_reason <- paste0(
+  nrow(plate_info), " plate(s), ", nrow(endpoints), " dose group(s); ",
+  length(key_levels), " panel(s) on ", length(pages), " page(s). Inspect the dose-response PDF."
+)
+
+save_rds(endpoints, out_path("endpoints", "rds"))
+outputs <- c(out_path("endpoints", "rds"))
+if (!is.null(pooled)) {
+  save_rds(pooled, out_path("endpoints-pooled", "rds"))
+  outputs <- c(outputs, out_path("endpoints-pooled", "rds"))
+}
+outputs <- c(outputs, pdf_file)
+
+manifest <- list(
+  skill = skill,
+  run_label = p$run_label,
+  status = status,
+  status_reason = status_reason,
+  rendered_at = format(Sys.time(), "%Y-%m-%dT%H:%M:%S"),
+  zfbehavior_version = as.character(utils::packageVersion("zfbehavior")),
+  upstream = lapply(ups, function(m) list(
+    run = m$.run,
+    skill = m$skill,
+    manifest = file.path(m$.run, "outputs", basename(m$.manifest_file)),
+    status = m$status
+  )),
+  inputs = list(list(
+    path = file.path(imp$.run, combined_rel),
+    md5 = md5_now,
+    md5_matches_upstream_manifest = !md5_drift
+  )),
+  outputs = lapply(outputs, function(f) list(path = f, md5 = md5(f))),
+  endpoint = list(
+    name = "percent of affected",
+    definition = "per dose group: N = wells (one larva each), n_affected = keep_well FALSE (dead or malformed)",
+    group_cols = id_cols,
+    pooled_group_cols = if (is.null(pooled)) NULL else unique(c(chemical_col, title_cols)),
+    tables = c(
+      list(endpoints = "one row per plate x dose group (always written)"),
+      if (!is.null(pooled)) list(`endpoints-pooled` = paste0(
+        "one row per ", chemical_col, " x dose group; N and n_affected summed over the ",
+        "chemical's plates at each concentration"
+      ))
+    ),
+    includes_vehicle_control_rows = TRUE
+  ),
+  plates_excluded_by_qc = lapply(seq_len(nrow(qc_excl)), function(i) as.list(qc_excl[i, ])),
+  summary = list(
+    n_plates = nrow(plate_info),
+    n_dose_groups = nrow(endpoints),
+    n_pooled_dose_groups = if (is.null(pooled)) NULL else nrow(pooled),
+    n_panels = length(key_levels),
+    n_pdf_pages = length(pages),
+    vc_pct_affected_max = max(vc_tbl$pct_affected),
+    concentration_units = if (has_unit) sort(unique(treated$concentration_unit)) else NULL
+  ),
+  parameters = p
+)
+yaml::write_yaml(manifest, out_path("manifest", "yml"))
+```
+
+**Status: `r status`.** `r status_reason`
+
+```{r}
+#| label: outputs
+
+knitr::kable(data.frame(output = c(outputs, out_path("manifest", "yml"))),
+             caption = "Files written by this run.")
+```

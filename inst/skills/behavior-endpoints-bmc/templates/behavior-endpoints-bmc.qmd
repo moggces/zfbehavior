@@ -1,0 +1,977 @@
+---
+title: "behavior-endpoints-bmc"
+subtitle: "Benchmark concentration (Curvep) of the behavioral endpoints, with dose-response and activity plots"
+format:
+  html:
+    toc: true
+    code-fold: true
+    embed-resources: true
+execute:
+  warning: true
+  message: false
+params:
+  # All values come from behavior-endpoints-bmc.yml (--execute-params);
+  # defaults are null on purpose (nested-map defaults are not valid params).
+  run_label: null
+  project_root: "../../.."
+  upstream: null
+  table: null
+  chemical_col: null
+  endpoint_types: null
+  similarity_metrics: null
+  bmr: null
+  estimate_n_samples: null
+  estimate_seed: null
+  n_samples: null
+  seed: null
+  workers: null
+  hit_threshold: null
+  chemical_label_cols: null
+  plate_label_cols: null
+  ncol: null
+  pdf_width: null
+  pdf_height_per_row: null
+  panel_order: null
+  activity_exclude_endpoints: null
+  activity_exclude_reason: null
+  n_per_page: null
+  order: null
+  chemical_wrap_width: null
+  activity_pdf_width: null
+  activity_pdf_height: null
+---
+
+<!--
+Template shipped with the zfbehavior package (inst/skills/behavior-endpoints-bmc/).
+Do not edit the analysis code below for a specific study -- put every
+study-specific choice in behavior-endpoints-bmc.yml and render with:
+
+  quarto render behavior-endpoints-bmc.qmd --execute-params behavior-endpoints-bmc.yml
+
+This document only calls exported zfbehavior functions (plus Rcurvep's own
+plot method on its BMR estimate). See inst/skills/CONVENTIONS.md.
+-->
+
+```{r}
+#| label: setup
+#| include: false
+
+library(zfbehavior)
+loadNamespace("Rcurvep")  # registers plot() for Rcurvep's BMR estimate
+
+p <- params
+skill <- "behavior-endpoints-bmc"
+
+stop_param <- function(msg) {
+  stop("behavior-endpoints-bmc parameter error: ", msg, call. = FALSE)
+}
+as_chr <- function(x) if (is.null(x)) character(0) else unlist(x, use.names = FALSE)
+or_default <- function(x, default) if (is.null(x) || length(x) == 0) default else x
+is_unset <- function(x) {
+  is.null(x) || length(x) != 1 || is.na(x) || !nzchar(trimws(as.character(x))) ||
+    identical(as.character(x), "CHANGE_ME")
+}
+num <- function(x, default, what, lower = -Inf, upper = Inf, integer = FALSE) {
+  v <- suppressWarnings(as.numeric(or_default(x, default)))
+  if (length(v) != 1 || !is.finite(v) || v < lower || v > upper || (integer && v != round(v))) {
+    stop_param(paste0("`", what, "` must be ", if (integer) "an integer" else "a number",
+                      " in [", lower, ", ", upper, "]."))
+  }
+  v
+}
+
+if (is.null(p$run_label) || !grepl("^[A-Za-z0-9_-]+$", p$run_label)) {
+  stop_param("`run_label` is required (letters, digits, '-', '_').")
+}
+upstream_runs <- sub("/+$", "", as_chr(p$upstream))
+if (length(upstream_runs) == 0) {
+  stop_param("`upstream` must list one behavior-endpoints run (plus optional intraplate-vc-qc runs).")
+}
+table_choice <- or_default(p$table, "per_plate")
+if (!table_choice %in% c("per_plate", "pooled")) stop_param("`table` must be per_plate or pooled.")
+all_types <- c("total_distance", "distance_change_shift", "movement_similarity")
+types <- or_default(as_chr(p$endpoint_types), all_types)
+if (length(setdiff(types, all_types)) > 0) {
+  stop_param(paste0("`endpoint_types` must be among ", paste(all_types, collapse = ", "), "."))
+}
+types <- intersect(all_types, types)
+similarity_metrics <- as_chr(p$similarity_metrics)
+
+# ---- BMR settings per endpoint type --------------------------------------
+type_defaults <- list(
+  total_distance = list(source = "estimate", rnge = "both", trsh = c(5, 95, 5)),
+  distance_change_shift = list(source = "control_mad", rnge = "up", trsh = NULL),
+  movement_similarity = list(source = "estimate", rnge = "down", trsh = c(5, 95, 5))
+)
+rnge_values <- list(up = 1e6, down = -1e6, both = c(-1e6, 1e6))
+bmr_cfg <- list()
+for (ty in types) {
+  cfg <- or_default(p$bmr[[ty]], list())
+  what <- function(x) paste0("bmr: ", ty, ": ", x)
+  source <- as.character(or_default(cfg$source, type_defaults[[ty]]$source))
+  if (!source %in% c("user", "estimate", "control_mad")) {
+    stop_param(paste0("`", what("source"), "` must be user, estimate or control_mad."))
+  }
+  rnge <- as.character(or_default(cfg$rnge, type_defaults[[ty]]$rnge))
+  if (!rnge %in% names(rnge_values)) stop_param(paste0("`", what("rnge"), "` must be up, down or both."))
+  trsh <- if ("trsh" %in% names(cfg)) cfg$trsh else type_defaults[[ty]]$trsh
+  if (!is.null(trsh)) {
+    trsh <- suppressWarnings(as.numeric(unlist(trsh)))
+    if (length(trsh) != 3 || any(!is.finite(trsh)) || trsh[1] < 0 || trsh[2] <= trsh[1] || trsh[3] <= 0 ||
+        length(seq(trsh[1], trsh[2], by = trsh[3])) < 4) {
+      stop_param(paste0("`", what("trsh"), "` must be null or [from, to, by] giving >= 4 values."))
+    }
+    trsh <- seq(trsh[1], trsh[2], by = trsh[3])
+  }
+  out <- list(source = source, rnge = rnge, directions = if (rnge == "both") c("down", "up") else rnge,
+              trsh = trsh, bmr = cfg$bmr,
+              reason = if (is_unset(cfg$reason)) NULL else as.character(cfg$reason))
+  if (source == "control_mad") {
+    out$scope <- as.character(or_default(cfg$scope, "global"))
+    if (!out$scope %in% c("global", "plate", "chemical")) {
+      stop_param(paste0("`", what("scope"), "` must be global, plate or chemical."))
+    }
+    if (out$scope == "plate" && table_choice != "per_plate") {
+      stop_param(paste0("`", what("scope"), ": plate` needs `table: per_plate`."))
+    }
+    if (out$scope == "chemical" && table_choice != "pooled") {
+      stop_param(paste0("`", what("scope"), ": chemical` needs `table: pooled`."))
+    }
+    pm <- or_default(cfg$plate_medians, FALSE)
+    if (length(pm) != 1 || !tolower(as.character(pm)) %in% c("true", "false", "yes", "no")) {
+      stop_param(paste0("`", what("plate_medians"), "` must be true or false."))
+    }
+    out$plate_medians <- tolower(as.character(pm)) %in% c("true", "yes")
+    if (out$plate_medians && ty != "distance_change_shift") {
+      stop_param(paste0("`", what("plate_medians"), "` is only for distance_change_shift: ",
+                        "the other types are normalized to each plate's own VC median, so every plate median is 0."))
+    }
+    if (out$plate_medians && out$scope == "plate") {
+      stop_param(paste0("`", what("plate_medians"), "` cannot be used with scope: plate (one median per plate)."))
+    }
+    out$n_mad <- num(cfg$n_mad, 3, what("n_mad"), lower = 0)
+    if (length(unlist(cfg$bmr)) > 0) {
+      stop_param(paste0("`", what("bmr"), "` is not used with source: control_mad; remove it or change the source."))
+    }
+  }
+  bmr_cfg[[ty]] <- out
+}
+
+estimate_n_samples <- num(p$estimate_n_samples, 10, "estimate_n_samples", lower = 1, integer = TRUE)
+estimate_seed <- num(p$estimate_seed, 2022, "estimate_seed", lower = 0, integer = TRUE)
+n_samples <- num(p$n_samples, 1000, "n_samples", lower = 1, integer = TRUE)
+seed <- num(p$seed, 2026, "seed", lower = 0, integer = TRUE)
+workers <- num(p$workers, 1, "workers", lower = 1, integer = TRUE)
+hit_threshold <- num(p$hit_threshold, 0.5, "hit_threshold", lower = 0, upper = 0.99)
+chemical_label_cols <- or_default(as_chr(p$chemical_label_cols), "CHEMICAL_NAME")
+plate_label_cols <- or_default(as_chr(p$plate_label_cols), "plate_id")
+n_col <- num(p$ncol, 4, "ncol", lower = 1, integer = TRUE)
+pdf_width <- num(p$pdf_width, 15, "pdf_width", lower = 1)
+pdf_height_per_row <- num(p$pdf_height_per_row, 2.2, "pdf_height_per_row", lower = 0.5)
+panel_order <- or_default(p$panel_order, "alphabetical")
+if (!panel_order %in% c("alphabetical", "group_key")) stop_param("`panel_order` must be alphabetical or group_key.")
+n_per_page <- num(p$n_per_page, 20, "n_per_page", lower = 1, integer = TRUE)
+plot_order <- or_default(p$order, "alphabetical")
+if (!plot_order %in% c("alphabetical", "as_given")) stop_param("`order` must be alphabetical or as_given.")
+chemical_wrap_width <- num(p$chemical_wrap_width, 50, "chemical_wrap_width", lower = 5, integer = TRUE)
+activity_pdf_width <- num(p$activity_pdf_width, 17, "activity_pdf_width", lower = 1)
+activity_pdf_height <- num(p$activity_pdf_height, 16, "activity_pdf_height", lower = 1)
+activity_exclude_endpoints <- as_chr(p$activity_exclude_endpoints)
+activity_exclude_reason <- if (is_unset(p$activity_exclude_reason)) NULL else as.character(p$activity_exclude_reason)
+if (length(activity_exclude_endpoints) > 0 && is.null(activity_exclude_reason)) {
+  stop_param("`activity_exclude_reason` is required when `activity_exclude_endpoints` is not empty.")
+}
+
+project_root <- normalizePath(p$project_root, mustWork = TRUE)
+out_dir <- "outputs"
+dir.create(out_dir, showWarnings = FALSE)
+out_path <- function(object, ext) {
+  file.path(out_dir, paste0(skill, "__", p$run_label, "__", object, ".", ext))
+}
+# CONVENTIONS.md section 2: every table saved to outputs/ is a tibble,
+# including tables one level inside a saved list / result object.
+save_rds <- function(x, path) {
+  as_tbl <- function(v) if (is.data.frame(v) && !inherits(v, "tbl_df")) tibble::as_tibble(v) else v
+  x <- as_tbl(x)
+  if (is.list(x) && !is.data.frame(x)) {
+    cls <- class(x)
+    x[] <- lapply(x, as_tbl)
+    class(x) <- cls
+  }
+  saveRDS(x, path)
+}
+md5 <- function(f) unname(tools::md5sum(f))
+type_file <- function(ty) gsub("_", "-", ty)
+
+# Saved Curvep runs (bmr-sweep-<type>.rds, curvep-raw-<type>.rds) are kept
+# between re-renders and reused when their key (data + settings) is
+# unchanged. Everything else from a previous pass is removed.
+reusable <- unlist(lapply(all_types, function(ty) {
+  c(out_path(paste0("bmr-sweep-", type_file(ty)), "rds"), out_path(paste0("curvep-raw-", type_file(ty)), "rds"))
+}))
+for (f in list.files(out_dir, pattern = paste0("^", skill, "__", p$run_label, "__"), full.names = TRUE)) {
+  if (!f %in% reusable) file.remove(f)
+}
+load_if_key <- function(path, key) {
+  if (!file.exists(path)) return(NULL)
+  obj <- readRDS(path)
+  if (identical(obj$key, key)) obj else NULL
+}
+with_workers <- function(expr) {
+  if (workers > 1 && requireNamespace("future", quietly = TRUE)) {
+    old_plan <- future::plan(future::multisession, workers = workers)
+    on.exit(future::plan(old_plan), add = TRUE)
+  }
+  expr
+}
+
+has_reactable <- requireNamespace("reactable", quietly = TRUE)
+show_table <- function(df, page_size = 15) {
+  if (has_reactable) {
+    reactable::reactable(df, filterable = TRUE, searchable = TRUE, sortable = TRUE,
+                         defaultPageSize = page_size, striped = TRUE, compact = TRUE)
+  } else {
+    knitr::kable(df, row.names = FALSE)
+  }
+}
+```
+
+## Run
+
+- Skill: `behavior-endpoints-bmc`
+- Run label: **`r p$run_label`**
+- Table: **`r table_choice`**; endpoint types: `r paste(types, collapse = ", ")`
+- BMR source per type: `r paste(paste0(types, " = ", vapply(bmr_cfg, function(x) x$source, "")), collapse = "; ")`
+- BMC: `r n_samples` bootstrap samples, seed `r seed`; hit = hit confidence > `r hit_threshold`
+- zfbehavior version: `r as.character(utils::packageVersion("zfbehavior"))`; Rcurvep `r as.character(utils::packageVersion("Rcurvep"))`
+- Rendered: `r format(Sys.time(), "%Y-%m-%d %H:%M:%S")`
+
+## Upstream
+
+Exactly one `complete` `behavior-endpoints` run, plus optional `complete`
+`intraplate-vc-qc` runs made on that same endpoints run, whose
+`excluded_plates` are dropped (`CONVENTIONS.md`, section 6).
+
+```{r}
+#| label: upstream
+
+read_manifest <- function(run) {
+  dir <- file.path(project_root, run)
+  f <- list.files(file.path(dir, "outputs"), pattern = "__manifest\\.yml$", full.names = TRUE)
+  if (length(f) != 1) {
+    stop("behavior-endpoints-bmc: no unique manifest found in ", file.path(dir, "outputs"), call. = FALSE)
+  }
+  m <- yaml::read_yaml(f)
+  if (!identical(m$status, "complete")) {
+    stop("behavior-endpoints-bmc: upstream run `", run, "` has status `", m$status,
+         "`, not `complete`. Resolve it first (", m$status_reason, ").", call. = FALSE)
+  }
+  m$.run <- run
+  m$.manifest_file <- f
+  m
+}
+check_md5 <- function(m, pattern, what) {
+  outs <- data.frame(path = vapply(m$outputs, `[[`, "", "path"),
+                     md5 = vapply(m$outputs, `[[`, "", "md5"), stringsAsFactors = FALSE)
+  rel <- outs$path[grepl(pattern, outs$path)]
+  if (length(rel) != 1) {
+    stop("behavior-endpoints-bmc: upstream manifest of `", m$.run, "` lists no ", what, " output.", call. = FALSE)
+  }
+  file <- file.path(project_root, m$.run, rel)
+  now <- md5(file)
+  drift <- !identical(now, outs$md5[outs$path == rel])
+  if (drift) {
+    warning("Upstream ", what, " md5 differs from its manifest (", m$.run, "): the run was ",
+            "modified after it completed. Confirm with the user before using these results.",
+            call. = FALSE)
+  }
+  list(file = file, rel = file.path(m$.run, rel), md5 = now, drift = drift)
+}
+
+ups <- lapply(upstream_runs, read_manifest)
+up_skills <- vapply(ups, function(m) as.character(m$skill), "")
+if (sum(up_skills == "behavior-endpoints") != 1) {
+  stop_param("`upstream` must list exactly one behavior-endpoints run.")
+}
+bad_up <- setdiff(up_skills, c("behavior-endpoints", "intraplate-vc-qc"))
+if (length(bad_up) > 0) {
+  stop_param(paste0("`upstream` may list only behavior-endpoints and intraplate-vc-qc runs (got ",
+                    paste(bad_up, collapse = ", "), ")."))
+}
+ep <- ups[[which(up_skills == "behavior-endpoints")]]
+qc_runs <- ups[up_skills == "intraplate-vc-qc"]
+for (m in qc_runs) {
+  qc_up <- vapply(m$upstream, function(u) sub("/+$", "", as.character(u$run)), "")
+  if (!ep$.run %in% qc_up) {
+    stop("behavior-endpoints-bmc: QC run `", m$.run, "` was made on ",
+         paste(qc_up, collapse = ", "), ", not on the endpoints run `", ep$.run, "`.", call. = FALSE)
+  }
+}
+ep_up_skills <- vapply(ep$upstream, function(u) as.character(u$skill), "")
+imp_run <- sub("/+$", "", as.character(ep$upstream[[which(ep_up_skills == "dataset-import-qc")]]$run))
+imp <- read_manifest(imp_run)
+endpoints_in <- check_md5(ep, "__endpoints\\.rds$", "endpoints.rds")
+combined_in <- check_md5(imp, "__combined\\.rds$", "combined.rds")
+
+up_tbl <- data.frame(
+  upstream = c(vapply(ups, `[[`, "", ".run"), imp$.run),
+  skill = c(up_skills, imp$skill),
+  used_for = c(ifelse(up_skills == "behavior-endpoints", "endpoints fitted", "plate exclusions"),
+               "chemical/plate labels only"),
+  status = c(vapply(ups, function(m) as.character(m$status), ""), imp$status),
+  # Only intraplate-vc-qc exclusions are applied here; plates excluded before
+  # the endpoints run are already absent from its endpoints.
+  plates_dropped_here = c(ifelse(up_skills == "intraplate-vc-qc",
+                                 as.character(vapply(ups, function(m) length(m$excluded_plates), 1L)), "-"),
+                          "-"),
+  stringsAsFactors = FALSE
+)
+knitr::kable(up_tbl, row.names = FALSE, caption = paste0(
+  "Upstream runs. endpoints.rds md5 matches its manifest: ", !endpoints_in$drift,
+  ". Plates excluded before the endpoints run (already absent): ", length(ep$plates_excluded_by_qc), "."
+))
+```
+
+```{r}
+#| label: load
+
+endpoints <- readRDS(endpoints_in$file)
+combined <- readRDS(combined_in$file)
+
+qc_excl <- do.call(rbind, c(
+  list(data.frame(plate_id = character(0), reason = character(0), qc_run = character(0))),
+  lapply(qc_runs, function(m) {
+    if (length(m$excluded_plates) == 0) return(NULL)
+    data.frame(
+      plate_id = vapply(m$excluded_plates, function(e) as.character(e$plate_id), ""),
+      reason = vapply(m$excluded_plates, function(e) as.character(e$reason), ""),
+      qc_run = m$.run, stringsAsFactors = FALSE
+    )
+  })
+))
+unknown_excl <- setdiff(qc_excl$plate_id, endpoints$plate_id)
+if (length(unknown_excl) > 0) {
+  stop("behavior-endpoints-bmc: QC-excluded plate(s) not in the endpoints: ",
+       paste(unknown_excl, collapse = ", "), call. = FALSE)
+}
+d <- as.data.frame(endpoints[!endpoints$plate_id %in% qc_excl$plate_id, , drop = FALSE])
+d$plate_id <- as.character(d$plate_id)
+
+# Endpoints of the selected types (and similarity metrics).
+d <- d[d$endpoint_type %in% types, , drop = FALSE]
+run_metrics <- unique(stats::na.omit(d$metric[d$endpoint_type == "movement_similarity"]))
+if ("movement_similarity" %in% types) {
+  if (length(similarity_metrics) == 0) similarity_metrics <- run_metrics
+  missing_metric <- setdiff(similarity_metrics, run_metrics)
+  if (length(missing_metric) > 0) {
+    stop_param(paste0("similarity metric(s) not in the endpoints run: ", paste(missing_metric, collapse = ", "),
+                      " (the run has: ", paste(run_metrics, collapse = ", "), ")."))
+  }
+  d <- d[d$endpoint_type != "movement_similarity" | d$metric %in% similarity_metrics, , drop = FALSE]
+}
+missing_types <- setdiff(types, d$endpoint_type)
+if (length(missing_types) > 0) {
+  stop_param(paste0("endpoint type(s) not in the endpoints run: ", paste(missing_types, collapse = ", ")))
+}
+endpoint_info <- unique(d[, c("endpoint", "endpoint_type", "segment", "component", "metric")])
+unknown_ex <- setdiff(activity_exclude_endpoints, unique(endpoints$endpoint))
+if (length(unknown_ex) > 0) {
+  stop_param(paste0("`activity_exclude_endpoints` has endpoint(s) not in the endpoints run: ",
+                    paste(unknown_ex, collapse = ", ")))
+}
+seg_order <- c(names(ep$method$segments), names(ep$method$similarity_segments))
+
+# Labels from the import data (one per plate).
+label_cols <- unique(c(chemical_label_cols, plate_label_cols))
+missing_cols <- setdiff(label_cols, names(combined))
+if (length(missing_cols) > 0) {
+  stop_param(paste0("label column(s) not in the import data: ", paste(missing_cols, collapse = ", ")))
+}
+plate_info <- unique(as.data.frame(combined)[combined$plate_id %in% d$plate_id,
+                                             unique(c("plate_id", label_cols)), drop = FALSE])
+plate_info$plate_id <- as.character(plate_info$plate_id)
+if (anyDuplicated(plate_info$plate_id)) stop_param("label columns are not constant within each plate.")
+join_cols <- function(df, cols) do.call(paste, c(lapply(cols, function(cc) as.character(df[[cc]])), sep = "@"))
+plate_info$chemical_label <- join_cols(plate_info, chemical_label_cols)
+plate_info$plate_label <- join_cols(plate_info, plate_label_cols)
+
+# Curve = one plate (per_plate) or one chemical, all its plates (pooled).
+if (table_choice == "per_plate") {
+  chemical_col <- NULL
+  d$curve_id <- d$plate_id
+  curve_info <- data.frame(curve_id = plate_info$plate_id, chemical_label = plate_info$chemical_label,
+                           plate_label = plate_info$plate_label, n_plates = 1L, stringsAsFactors = FALSE)
+} else {
+  chemical_col <- as.character(or_default(p$chemical_col,
+                                          if (identical(ep$method$layout, "by_chemical_pooled")) ep$method$chemical_col else "DTXSID"))
+  if (!chemical_col %in% names(d)) {
+    stop_param(paste0("`chemical_col` (", chemical_col, ") is not a column of the endpoint table; ",
+                      "use a behavior-endpoints run with layout: by_chemical_pooled (it keeps the chemical columns)."))
+  }
+  if (anyNA(d[[chemical_col]])) stop_param(paste0("`chemical_col` (", chemical_col, ") has missing values."))
+  d$curve_id <- as.character(d[[chemical_col]])
+  cp <- unique(d[, c("curve_id", "plate_id")])
+  cp$chemical_label <- plate_info$chemical_label[match(cp$plate_id, plate_info$plate_id)]
+  curve_info <- do.call(rbind, lapply(split(cp, cp$curve_id), function(x) {
+    data.frame(curve_id = x$curve_id[1], chemical_label = paste(unique(x$chemical_label), collapse = "; "),
+               plate_label = paste0("pooled (", nrow(x), " plate", if (nrow(x) > 1) "s", ")"),
+               n_plates = nrow(x), stringsAsFactors = FALSE)
+  }))
+}
+
+# Curvep input: treated wells; concentration as log10(concentration / 1e6).
+curvep_in <- d[!d$is_vehicle_control, c("curve_id", "plate_id", "endpoint", "endpoint_type",
+                                        "concentration", "concentration_unit", "endpoint_value_norm")]
+names(curvep_in)[names(curvep_in) == "endpoint_value_norm"] <- "resp"
+curvep_in <- curvep_in[!is.na(curvep_in$resp), , drop = FALSE]
+curvep_in$log_conc <- log10(curvep_in$concentration / 1e6)
+if (any(!is.finite(curvep_in$log_conc))) {
+  stop("behavior-endpoints-bmc: non-positive concentration in a treated well.", call. = FALSE)
+}
+unit_per_curve <- tapply(curvep_in$concentration_unit, curvep_in$curve_id, function(u) length(unique(u)))
+if (any(unit_per_curve > 1)) {
+  stop("behavior-endpoints-bmc: curve(s) mixing concentration units (never pooled): ",
+       paste(names(unit_per_curve)[unit_per_curve > 1], collapse = ", "), call. = FALSE)
+}
+curve_info$concentration_unit <- curvep_in$concentration_unit[match(curve_info$curve_id, curvep_in$curve_id)]
+curve_info <- curve_info[curve_info$curve_id %in% curvep_in$curve_id, , drop = FALSE]
+
+knitr::kable(data.frame(
+  plates_in_endpoints = length(unique(endpoints$plate_id)),
+  plates_excluded_by_qc = length(unique(qc_excl$plate_id)),
+  plates_used = length(unique(d$plate_id)),
+  curves = nrow(curve_info),
+  endpoints = nrow(endpoint_info),
+  concentration_units = paste(sort(unique(curve_info$concentration_unit)), collapse = ", ")
+), caption = paste0("Data fitted (", table_choice, "; value: endpoint_value_norm; log10(concentration / 1e6))."))
+if (nrow(qc_excl) > 0) knitr::kable(qc_excl, row.names = FALSE, caption = "Plates excluded by intraplate-vc-qc runs.")
+```
+
+## BMR
+
+The BMR is the Curvep baseline threshold (`TRSH`) in normalized-response
+units, set per endpoint type and direction (`rnge`). Sources: `user` (given
+value), `estimate` (Rcurvep knee-point estimate, reviewed by the user before
+use), `control_mad` (median + n_mad x MAD of the vehicle-control values
+chosen by `scope`, optionally per-plate medians).
+
+```{r}
+#| label: bmr-settings
+
+knitr::kable(do.call(rbind, lapply(types, function(ty) {
+  x <- bmr_cfg[[ty]]
+  data.frame(
+    endpoint_type = ty, source = x$source, rnge = x$rnge,
+    scope = if (x$source == "control_mad") x$scope else "-",
+    plate_medians = if (x$source == "control_mad") x$plate_medians else NA,
+    n_mad = if (x$source == "control_mad") x$n_mad else NA,
+    estimate_range = if (x$source != "estimate") "-" else if (is.null(x$trsh)) "from the data" else
+      paste0(min(x$trsh), "-", max(x$trsh), " by ", diff(x$trsh)[1]),
+    reason = or_default(x$reason, "-"),
+    stringsAsFactors = FALSE
+  )
+})), row.names = FALSE, caption = "BMR settings per endpoint type.")
+```
+
+```{r}
+#| label: bmr-estimate
+#| results: asis
+
+# Read a user BMR: a number, a map endpoint: number, or (rnge both) a map
+# {up: ..., down: ...} of those. Returns one row per endpoint x direction.
+read_user_bmr <- function(ty, value) {
+  eps <- endpoint_info$endpoint[endpoint_info$endpoint_type == ty]
+  dirs <- bmr_cfg[[ty]]$directions
+  grid <- expand.grid(endpoint = eps, direction = dirs, stringsAsFactors = FALSE)
+  grid$bmr <- NA_real_
+  bad <- function(msg) stop_param(paste0("`bmr: ", ty, ": bmr` ", msg))
+  set_value <- function(v, rows, where) {
+    if (is.null(v)) return(invisible())
+    if (is.list(v) || length(v) != 1) bad(paste0(where, "must be a number."))
+    v <- suppressWarnings(as.numeric(v))
+    if (!is.finite(v) || v <= 0) bad(paste0(where, "must be a positive number."))
+    grid$bmr[rows] <<- v
+  }
+  fill_endpoints <- function(v, dir_rows, where) {
+    if (is.list(v) && !is.null(names(v))) {
+      unknown <- setdiff(names(v), eps)
+      if (length(unknown) > 0) bad(paste0(where, "has unknown endpoint(s): ", paste(unknown, collapse = ", "),
+                                          " (endpoints: ", paste(eps, collapse = ", "), ")."))
+      for (e in names(v)) set_value(v[[e]], dir_rows & grid$endpoint == e, paste0(where, e, ": "))
+    } else {
+      set_value(v, dir_rows, where)
+    }
+  }
+  if (is.null(value) || length(unlist(value)) == 0) return(grid)
+  if (length(dirs) == 2 && is.list(value) && !is.null(names(value)) && all(names(value) %in% c("up", "down"))) {
+    for (dd in names(value)) fill_endpoints(value[[dd]], grid$direction == dd, paste0(dd, ": "))
+  } else if (length(dirs) == 2) {
+    bad("must be a map {up: ..., down: ...} for rnge: both.")
+  } else {
+    fill_endpoints(value, rep(TRUE, nrow(grid)), "")
+  }
+  grid
+}
+
+bmr_rows <- list()
+estimates <- list()
+sweep_status <- list()
+pending <- character(0)
+for (ty in types) {
+  x <- bmr_cfg[[ty]]
+  ty_data <- curvep_in[curvep_in$endpoint_type == ty, , drop = FALSE]
+  if (x$source == "control_mad") {
+    vc <- d[d$endpoint_type == ty, , drop = FALSE]
+    group_cols <- switch(x$scope, global = "endpoint", plate = c("endpoint", "curve_id"),
+                         chemical = c("endpoint", "curve_id"))
+    b <- as.data.frame(estimate_bmr_from_control(
+      vc, group_cols = group_cols, value_col = "endpoint_value_norm",
+      plate_col = if (x$plate_medians) "plate_id" else NULL, n_mad = x$n_mad
+    ))
+    b <- merge(b, data.frame(direction = x$directions, stringsAsFactors = FALSE), by = NULL)
+    if (any(b$bmr <= 0)) {
+      stop("behavior-endpoints-bmc: control_mad gives a BMR <= 0 for ", ty, " (",
+           paste(unique(b$endpoint[b$bmr <= 0]), collapse = ", "), "); choose another source.", call. = FALSE)
+    }
+  } else {
+    b <- read_user_bmr(ty, x$bmr)
+    if (any(!is.na(b$bmr)) && is.null(x$reason)) {
+      stop_param(paste0("`bmr: ", ty, ": reason` is required with `bmr` (why this BMR)."))
+    }
+    if (x$source == "user" && anyNA(b$bmr)) {
+      stop_param(paste0("`bmr: ", ty, ": bmr` is missing for: ",
+                        paste(paste0(b$endpoint, " (", b$direction, ")")[is.na(b$bmr)], collapse = ", "),
+                        " (source: user)."))
+    }
+    if (x$source == "estimate") {
+      key <- list(data = rlang::hash(ty_data[, c("curve_id", "endpoint", "log_conc", "resp")]),
+                  rnge = rnge_values[[x$rnge]], trsh = x$trsh,
+                  n_samples = estimate_n_samples, seed = estimate_seed)
+      f <- out_path(paste0("bmr-sweep-", type_file(ty)), "rds")
+      saved <- load_if_key(f, key)
+      if (!is.null(saved)) {
+        est <- saved$est
+        sweep_status[[ty]] <- "reused"
+      } else {
+        est <- with_workers(suppressWarnings(estimate_bmr_curvep(
+          ty_data, conc_col = "log_conc", rnge = rnge_values[[x$rnge]], n_samples = estimate_n_samples,
+          chemical_col = "curve_id", value_col = "resp", trsh_seq = x$trsh, seed = estimate_seed
+        )))
+        sweep_status[[ty]] <- "computed"
+        save_rds(list(key = key, est = est), f)
+      }
+      estimates[[ty]] <- est
+      if (all(is.na(b$bmr))) {
+        pending <- c(pending, ty)
+      } else if (anyNA(b$bmr)) {
+        stop_param(paste0("`bmr: ", ty, ": bmr` is missing for: ",
+                          paste(paste0(b$endpoint, " (", b$direction, ")")[is.na(b$bmr)], collapse = ", "),
+                          " (give every endpoint and direction, or none to review the estimate first)."))
+      }
+    }
+  }
+  b$endpoint_type <- ty
+  b$source <- x$source
+  b$scope <- if (x$source == "control_mad") x$scope else NA_character_
+  b$plate_medians <- if (x$source == "control_mad") x$plate_medians else NA
+  b$n_mad <- if (x$source == "control_mad") x$n_mad else NA_real_
+  b$reason <- or_default(x$reason, NA_character_)
+  bmr_rows[[ty]] <- b
+}
+
+for (ty in names(estimates)) {
+  est <- estimates[[ty]]
+  out <- as.data.frame(est$estimate$outcome)
+  out$direction <- ifelse(out$RNGE > 0, "up", "down")
+  out <- merge(out, as.data.frame(est$trsh_seq), by = "endpoint")
+  out <- out[, intersect(c("endpoint", "direction", "bmr_ori", "bmr_exp", "qc", "trsh_from", "trsh_to",
+                           "trsh_by", "n_trsh"), names(out))]
+  save_rds(est$estimate, out_path(paste0("bmr-estimate-", type_file(ty)), "rds"))
+  cat("\n### Knee-point estimate:", ty, "\n\n")
+  print(knitr::kable(out, row.names = FALSE, caption = paste0(
+    "Rcurvep::estimate_dataset_bmr() (", estimate_n_samples, " samples, seed ", estimate_seed,
+    "; sweep ", sweep_status[[ty]], "). A suggestion only: the user chooses the BMR.")))
+  bmr_plot <- plot(est$estimate)
+  n_panels <- nrow(est$estimate$outcome)
+  h <- max(5, 2.5 * ceiling(n_panels / 4))
+  grDevices::pdf(out_path(paste0("bmr-estimate-", type_file(ty)), "pdf"), width = 12, height = h)
+  print(bmr_plot)
+  invisible(grDevices::dev.off())
+  cat("\nPlot: `", out_path(paste0("bmr-estimate-", type_file(ty)), "pdf"), "`\n\n", sep = "")
+}
+if (length(pending) > 0) {
+  cat("\n**No BMR chosen yet for:", paste(pending, collapse = ", "),
+      "** -- review the estimate(s) above, then set `bmr` and `reason` for that type in the yml and",
+      "re-render (the saved sweep is reused).\n")
+}
+```
+
+```{r}
+#| label: tbl-bmr
+
+bmr_table <- do.call(rbind, lapply(bmr_rows, function(b) {
+  cols <- c("endpoint_type", "endpoint", "curve_id", "direction", "bmr", "source",
+            "scope", "plate_medians", "n_mad", "n_values", "vc_median", "vc_mad", "reason")
+  for (cc in setdiff(cols, names(b))) b[[cc]] <- NA
+  b[, cols]
+}))
+rownames(bmr_table) <- NULL
+bmr_table$RNGE <- ifelse(bmr_table$direction == "up", 1e6, -1e6)
+bmr_show <- bmr_table
+if (all(is.na(bmr_show$curve_id))) {
+  bmr_show$curve_id <- NULL
+} else {
+  # Per-plate / per-chemical BMRs: summarize per endpoint here (all in bmr-table.rds).
+  bmr_show <- do.call(rbind, lapply(split(bmr_show, paste(bmr_show$endpoint, bmr_show$direction)), function(x) {
+    data.frame(x[1, c("endpoint_type", "endpoint", "direction", "source", "scope", "plate_medians", "n_mad")],
+               curves = nrow(x), bmr_min = signif(min(x$bmr), 3), bmr_median = signif(stats::median(x$bmr), 3),
+               bmr_max = signif(max(x$bmr), 3))
+  }))
+}
+num_cols <- vapply(bmr_show, is.double, TRUE)
+bmr_show[num_cols] <- lapply(bmr_show[num_cols], signif, 4)
+show_table(bmr_show[order(match(bmr_show$endpoint_type, all_types), bmr_show$endpoint), ], page_size = 25)
+```
+
+## BMC
+
+One Curvep run per endpoint type (`run_bmc_curvep()`, endpoints x
+directions x curves), reused when the data, BMRs and settings are
+unchanged. BMC = `10^POD * 1e6`, in the curve's concentration unit.
+
+```{r}
+#| label: bmc
+
+bmc_status <- list()
+results <- NULL
+ready <- setdiff(types, pending)
+res_list <- list()
+for (ty in ready) {
+  ty_data <- curvep_in[curvep_in$endpoint_type == ty, , drop = FALSE]
+  bt <- bmr_table[bmr_table$endpoint_type == ty, , drop = FALSE]
+  keyed <- !all(is.na(bt$curve_id))
+  bt_run <- bt[, c("endpoint", if (keyed) "curve_id", "bmr", "RNGE"), drop = FALSE]
+  key <- list(data = rlang::hash(ty_data[, c("curve_id", "endpoint", "log_conc", "resp")]),
+              bmr = rlang::hash(bt_run), n_samples = n_samples, seed = seed)
+  f <- out_path(paste0("curvep-raw-", type_file(ty)), "rds")
+  saved <- load_if_key(f, key)
+  if (!is.null(saved)) {
+    bmc <- saved$bmc
+    bmc_status[[ty]] <- "reused"
+  } else {
+    t0 <- Sys.time()
+    bmc <- with_workers(run_bmc_curvep(
+      ty_data, bmr_table = bt_run, chemical_col = "curve_id", conc_col = "log_conc",
+      value_col = "resp", bmr_key_cols = if (keyed) "curve_id" else NULL,
+      n_samples = n_samples, seed = seed
+    ))
+    bmc_status[[ty]] <- paste0("computed (", round(as.numeric(difftime(Sys.time(), t0, units = "mins")), 1), " min)")
+    save_rds(list(key = key, bmc = bmc), f)
+  }
+  act <- as.data.frame(bmc$act_summary)
+  act[] <- lapply(act, function(v) if (is.numeric(v)) unname(v) else v)  # drop "2.5%" names
+  names(act)[names(act) == "chemical"] <- "curve_id"
+  act$direction <- ifelse(act$RNGE > 0, "up", "down")
+  res_list[[ty]] <- act
+}
+
+if (length(res_list) > 0) {
+  act <- do.call(rbind, lapply(res_list, function(a) a[, Reduce(intersect, lapply(res_list, names))]))
+  rownames(act) <- NULL
+  results <- merge(curve_info, act, by = "curve_id", sort = FALSE)
+  results <- merge(endpoint_info, results, by = "endpoint", sort = FALSE)
+  results$hit <- results$hit_confidence > hit_threshold
+  results$BMC <- 10^results$POD_med * 1e6
+  results$BMCL <- 10^results$POD_cil * 1e6
+  results$BMCU <- 10^results$POD_ciu * 1e6
+  # One direction per curve x endpoint is plotted: the one with the higher
+  # hit confidence (then the lower POD); single-direction types: that one.
+  ord <- order(results$curve_id, results$endpoint, -results$hit_confidence, results$POD_med)
+  results <- results[ord, , drop = FALSE]
+  results$plotted <- !duplicated(results[, c("curve_id", "endpoint")])
+  lead <- c("endpoint_type", "endpoint", "direction", "curve_id", "chemical_label", "plate_label", "n_plates",
+            "concentration_unit", "TRSH", "RNGE", "hit_confidence", "hit", "plotted", "BMC", "BMCL", "BMCU")
+  results <- results[order(match(results$endpoint_type, all_types), match(results$segment, seg_order),
+                           results$endpoint, -results$hit_confidence, results$curve_id), ]
+  results <- tibble::as_tibble(results[, c(lead, setdiff(names(results), lead))])
+
+  counts <- do.call(rbind, lapply(split(results, list(results$endpoint, results$direction), drop = TRUE), function(x) {
+    data.frame(endpoint_type = x$endpoint_type[1], endpoint = x$endpoint[1], direction = x$direction[1],
+               bmr = signif(stats::median(x$TRSH), 4), curves = nrow(x), hits = sum(x$hit),
+               stringsAsFactors = FALSE)
+  }))
+  counts <- counts[order(match(counts$endpoint_type, all_types),
+                         match(endpoint_info$segment[match(counts$endpoint, endpoint_info$endpoint)], seg_order),
+                         counts$endpoint, counts$direction), ]
+  knitr::kable(counts, row.names = FALSE, caption = paste0(
+    "Curves and hits per endpoint and direction (hit = hit_confidence > ", hit_threshold,
+    "; bmr = median over curves). Curvep: ",
+    paste(paste0(names(bmc_status), " ", unlist(bmc_status)), collapse = "; "), "."))
+} else {
+  cat("BMC not calculated: no endpoint type has a chosen BMR yet.\n")
+}
+```
+
+```{r}
+#| label: tbl-hits
+
+if (!is.null(results)) {
+  tbl <- as.data.frame(results[results$hit, c("chemical_label", "plate_label", "endpoint", "direction",
+                                               "hit_confidence", "BMC", "BMCL", "BMCU", "concentration_unit",
+                                               "TRSH", "POD_med")])
+  num_cols <- vapply(tbl, is.double, TRUE)
+  tbl[num_cols] <- lapply(tbl[num_cols], signif, 3)
+  show_table(tbl, page_size = 20)
+}
+```
+
+## Dose-response plots with BMC
+
+`plot_behavior_dose_response_pages()`: normalized response per dose group
+(vehicle control `VC`), one panel per curve
+(`r if (table_choice == "pooled") "chemical, points coloured by plate" else "plate"`),
+one row per endpoint; BMC and score labels on hits only. Total distance:
+the direction with the higher hit confidence is labelled, with an up/down
+arrow.
+
+```{r}
+#| label: plots
+
+pdf_info <- data.frame(pdf = character(0), endpoints = integer(0), pages = integer(0))
+first_page <- NULL
+if (!is.null(results)) {
+  plot_base <- d
+  plot_base$plot_title <- if (table_choice == "per_plate") {
+    paste(curve_info$chemical_label, curve_info$plate_label, sep = " | ")[match(plot_base$curve_id, curve_info$curve_id)]
+  } else {
+    paste(curve_info$chemical_label, curve_info$curve_id, sep = " | ")[match(plot_base$curve_id, curve_info$curve_id)]
+  }
+  titles <- unique(plot_base[, c("curve_id", "plot_title")])
+  key_levels <- if (panel_order == "alphabetical") {
+    titles$curve_id[order(tolower(titles$plot_title), titles$plot_title, method = "radix")]
+  } else {
+    sort(titles$curve_id)
+  }
+  plot_base$panel_key <- factor(plot_base$curve_id, levels = key_levels)
+
+  pl <- results[results$plotted, , drop = FALSE]
+  bmc_plot <- data.frame(panel_key = pl$curve_id, endpoint = pl$endpoint,
+                         BMC = ifelse(pl$hit, pl$BMC, NA_real_), score = pl$hit_confidence,
+                         direction = pl$direction, stringsAsFactors = FALSE)
+  seg_names <- names(ep$method$segments)
+  groups <- list(
+    `total-distance` = list(type = "total_distance", rows = seg_names, y = "total distance (normalized)"),
+    `distance-change` = list(type = "distance_change_shift", rows = paste0(seg_names, "@both_auc"),
+                             y = "distance change (normalized)"),
+    `distance-shift` = list(type = "distance_change_shift",
+                            rows = as.vector(rbind(paste0(seg_names, "@down_auc"), paste0(seg_names, "@up_auc"))),
+                            y = "distance shift (normalized)"),
+    `movement-similarity` = list(type = "movement_similarity",
+                                 rows = endpoint_info$endpoint[endpoint_info$endpoint_type == "movement_similarity"],
+                                 y = "movement similarity (normalized)")
+  )
+  for (g in names(groups)) {
+    gg <- groups[[g]]
+    if (!gg$type %in% ready) next
+    dg <- plot_base[plot_base$endpoint %in% gg$rows, , drop = FALSE]
+    if (nrow(dg) == 0) next
+    two_dir <- length(bmr_cfg[[gg$type]]$directions) == 2
+    pages <- plot_behavior_dose_response_pages(
+      dg, group_cols = "panel_key", title_col = "plot_title",
+      bmc_data = bmc_plot[bmc_plot$endpoint %in% gg$rows, , drop = FALSE],
+      direction_col = if (two_dir) "direction" else NULL,
+      endpoint_order = gg$rows, point_colour_col = if (table_choice == "pooled") "plate_id" else NULL,
+      y_label = gg$y, nrow = 1, ncol = n_col
+    )
+    height <- 1.5 + pdf_height_per_row * length(unique(dg$endpoint))
+    f <- out_path(paste0("dose-response-", g), "pdf")
+    dev_fun <- if (capabilities("cairo")) grDevices::cairo_pdf else grDevices::pdf
+    dev_fun(f, width = pdf_width, height = height, onefile = TRUE)
+    for (pg in pages) {
+      grid::grid.newpage()
+      grid::grid.draw(pg)
+    }
+    invisible(grDevices::dev.off())
+    if (is.null(first_page)) first_page <- list(page = pages[[1]], height = height, pdf = f)
+    pdf_info <- rbind(pdf_info, data.frame(pdf = f, endpoints = length(unique(dg$endpoint)), pages = length(pages)))
+  }
+  knitr::kable(pdf_info, row.names = FALSE, caption = paste0("Dose-response PDFs written (",
+                                                              length(key_levels), " panels each)."))
+}
+```
+
+```{r}
+#| label: fig-first-page
+#| fig-cap: "First page of the first dose-response PDF (BMC labels on hits)."
+#| fig-width: !expr pdf_width
+#| fig-height: !expr if (exists("first_page") && !is.null(first_page)) first_page$height else 5
+
+if (!is.null(first_page)) {
+  grid::grid.newpage()
+  grid::grid.draw(first_page$page)
+}
+```
+
+## Activity plot
+
+`plot_behavior_bmc_activity_pages()`, the same layout as the ANOVA activity
+plot: chemicals as facet rows (`r plot_order`; `r n_per_page` plate rows
+per page), `r if (table_choice == "pooled") "the pooled curve" else "plates"`
+as rows within a chemical, columns = endpoint families, x = segments. Point
+size = hit-confidence class; only hits are drawn, labelled with the BMC
+(total distance: with the direction arrow). Endpoints left out of this plot:
+`r if (length(activity_exclude_endpoints) == 0) "none" else paste(activity_exclude_endpoints, collapse = ", ")`.
+
+```{r}
+#| label: activity-pdf
+#| results: asis
+
+activity <- NULL
+n_hits_not_in_activity <- 0L
+n_label_overflow <- 0L
+n_activity_pages <- 0L
+activity_pdf <- out_path("activity", "pdf")
+if (!is.null(results)) {
+  activity <- results[results$plotted, c("curve_id", "chemical_label", "plate_label", "endpoint", "endpoint_type",
+                                         "segment", "component", "metric", "direction", "hit_confidence", "hit",
+                                         "BMC", "concentration_unit")]
+  two_dir_types <- types[vapply(types, function(ty) length(bmr_cfg[[ty]]$directions) == 2, TRUE)]
+  arrow <- ifelse(activity$endpoint_type %in% two_dir_types,
+                  ifelse(activity$direction == "up", "\u2191 ", "\u2193 "), "")
+  activity$label <- paste0(arrow, signif(activity$BMC, 2), " ", activity$concentration_unit)
+  activity$in_activity_pdf <- !activity$endpoint %in% activity_exclude_endpoints
+  n_hits_not_in_activity <- sum(activity$hit & !activity$in_activity_pdf)
+  if (length(activity_exclude_endpoints) > 0) {
+    print(knitr::kable(
+      data.frame(endpoint = activity_exclude_endpoints,
+                 hits_not_plotted = vapply(activity_exclude_endpoints, function(e)
+                   sum(activity$hit & activity$endpoint == e), 1L)),
+      row.names = FALSE,
+      caption = paste0("Endpoints fitted but left out of the activity PDF (reason: ", activity_exclude_reason,
+                       "). Their results stay in bmc-results.rds and the dose-response PDFs.")))
+  }
+  plot_rows <- activity[activity$in_activity_pdf, , drop = FALSE]
+  if (nrow(plot_rows) == 0) stop_param("`activity_exclude_endpoints` leaves nothing to plot.")
+  pages <- plot_behavior_bmc_activity_pages(
+    plot_rows, chemical_col = "chemical_label", plate_label_col = "plate_label",
+    hit_threshold = hit_threshold, label_col = "label", segment_levels = seg_order,
+    order = plot_order, n_per_page = n_per_page, page_height = activity_pdf_height,
+    chemical_wrap_width = chemical_wrap_width
+  )
+  label_fit <- attr(pages, "label_fit")
+  n_label_overflow <- sum(!label_fit$fits)
+  # cairo_pdf renders non-ASCII names and the arrows.
+  dev_fun <- if (capabilities("cairo")) grDevices::cairo_pdf else grDevices::pdf
+  dev_fun(activity_pdf, width = activity_pdf_width, height = activity_pdf_height, onefile = TRUE)
+  for (pg in pages) {
+    grid::grid.newpage()
+    grid::grid.draw(pg)
+  }
+  invisible(grDevices::dev.off())
+  n_activity_pages <- length(pages)
+  print(knitr::kable(data.frame(pdf = activity_pdf, pages = n_activity_pages,
+                                chemicals = length(unique(plot_rows$chemical_label)),
+                                plate_rows_per_page = paste(attr(pages, "page_plate_rows"), collapse = ", "),
+                                labels_not_fitting = n_label_overflow),
+                     caption = "Activity PDF written."))
+  if (n_label_overflow > 0) {
+    warning(n_label_overflow, " chemical label(s) are taller than their panel at activity_pdf_height = ",
+            activity_pdf_height, " in: increase `activity_pdf_height` or `chemical_wrap_width`.", call. = FALSE)
+    print(knitr::kable(as.data.frame(label_fit[!label_fit$fits, ]), row.names = FALSE,
+                       caption = "Chemical labels that do not fit their panel."))
+  }
+}
+```
+
+## Status and outputs
+
+```{r}
+#| label: save
+
+if (length(pending) > 0) {
+  status <- "needs_review"
+  status_reason <- paste0(
+    "BMR estimate done for ", paste(pending, collapse = ", "),
+    ". Review it, then set `bmr` and `reason` for that type in the yml and re-render."
+  )
+} else {
+  status <- "complete"
+  status_reason <- paste0(length(unique(results$curve_id)), " curve(s), ", nrow(results), " curve x endpoint x ",
+                          "direction fits, ", sum(results$hit), " hit(s) (", sum(results$hit & results$plotted),
+                          " plotted). Inspect the dose-response and activity PDFs.")
+}
+
+outputs <- character(0)
+save_rds(tibble::as_tibble(bmr_table), out_path("bmr-table", "rds"))
+outputs <- c(outputs, out_path("bmr-table", "rds"))
+for (ty in names(estimates)) {
+  outputs <- c(outputs, out_path(paste0("bmr-sweep-", type_file(ty)), "rds"),
+               out_path(paste0("bmr-estimate-", type_file(ty)), "rds"),
+               out_path(paste0("bmr-estimate-", type_file(ty)), "pdf"))
+}
+if (!is.null(results)) {
+  save_rds(results, out_path("bmc-results", "rds"))
+  save_rds(tibble::as_tibble(activity), out_path("activity", "rds"))
+  outputs <- c(outputs, vapply(ready, function(ty) out_path(paste0("curvep-raw-", type_file(ty)), "rds"), ""),
+               out_path("bmc-results", "rds"), pdf_info$pdf, out_path("activity", "rds"), activity_pdf)
+}
+outputs <- unname(outputs)
+
+manifest <- list(
+  skill = skill,
+  run_label = p$run_label,
+  status = status,
+  status_reason = status_reason,
+  rendered_at = format(Sys.time(), "%Y-%m-%dT%H:%M:%S"),
+  zfbehavior_version = as.character(utils::packageVersion("zfbehavior")),
+  rcurvep_version = as.character(utils::packageVersion("Rcurvep")),
+  upstream = lapply(ups, function(m) list(
+    run = m$.run, skill = m$skill,
+    manifest = file.path(m$.run, "outputs", basename(m$.manifest_file)), status = m$status
+  )),
+  import_run = imp$.run,
+  inputs = list(
+    list(path = endpoints_in$rel, md5 = endpoints_in$md5, md5_matches_upstream_manifest = !endpoints_in$drift),
+    list(path = combined_in$rel, md5 = combined_in$md5, md5_matches_upstream_manifest = !combined_in$drift)
+  ),
+  outputs = lapply(outputs, function(f) list(path = f, md5 = md5(f))),
+  method = list(
+    table = table_choice,
+    chemical_col = chemical_col,
+    value = "endpoint_value_norm",
+    conc_transform = "log10(concentration / 1e6); BMC = 10^POD * 1e6 in the curve's unit",
+    concentration_units = as.list(sort(unique(curve_info$concentration_unit))),
+    endpoint_types = as.list(types),
+    similarity_metrics = as.list(similarity_metrics),
+    bmr = lapply(bmr_cfg, function(x) x[setdiff(names(x), "directions")]),
+    estimate_n_samples = estimate_n_samples, estimate_seed = estimate_seed,
+    n_samples = n_samples, seed = seed, hit_threshold = hit_threshold,
+    plotted_direction = "higher hit confidence (then lower POD) per curve x endpoint",
+    activity_exclude_endpoints = as.list(activity_exclude_endpoints),
+    activity_exclude_reason = activity_exclude_reason
+  ),
+  curvep_runs = list(bmr_sweep = sweep_status, bmc = bmc_status),
+  plates_excluded_by_qc = lapply(seq_len(nrow(qc_excl)), function(i) as.list(qc_excl[i, ])),
+  summary = list(
+    n_plates = length(unique(d$plate_id)),
+    n_curves = nrow(curve_info),
+    pending_bmr = as.list(pending),
+    n_hits = if (is.null(results)) NULL else sum(results$hit),
+    hits_per_type = if (is.null(results)) NULL else as.list(tapply(results$hit, results$endpoint_type, sum)),
+    n_activity_pages = n_activity_pages,
+    n_hits_not_in_activity = n_hits_not_in_activity,
+    n_labels_not_fitting = n_label_overflow
+  ),
+  parameters = p
+)
+yaml::write_yaml(manifest, out_path("manifest", "yml"))
+```
+
+**Status: `r status`.** `r status_reason`
+
+```{r}
+#| label: outputs
+
+knitr::kable(data.frame(output = c(outputs, out_path("manifest", "yml"))),
+             caption = "Files written by this run.")
+```

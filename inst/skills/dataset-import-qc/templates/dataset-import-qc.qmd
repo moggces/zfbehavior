@@ -1,0 +1,1016 @@
+---
+title: "dataset-import-qc"
+subtitle: "Import zebrafish behavioral plate data, per-plate + dataset-level QC"
+format:
+  html:
+    toc: true
+    code-fold: true
+    embed-resources: true
+execute:
+  warning: true
+  message: false
+params:
+  # All values come from dataset-import-qc.yml (--execute-params); defaults
+  # are null on purpose (nested-map defaults are not valid knitr params).
+  run_label: null
+  project_root: "../../.."
+  input: null
+  column_mapping: null
+  optional_roles: null
+  col_types: null
+  derive_time_value_from_binning: null
+  plate_qc: null
+  dataset_qc: null
+  exclude_plates: null
+  keep_well: null
+  provider_removed_wells: null
+  remove_wells: null
+  flag_comment_column: null
+  flag_comment_pattern: null
+  keep_flagged_wells: null
+  min_kept_vc_pct: null
+  accept_low_vc_plates: null
+---
+
+<!--
+Template shipped with the zfbehavior package (inst/skills/dataset-import-qc/).
+Do not edit the analysis code below for a specific study -- put every
+study-specific choice in dataset-import-qc.yml and render with:
+
+  quarto render dataset-import-qc.qmd --execute-params dataset-import-qc.yml
+
+This document only calls exported zfbehavior functions. See
+inst/skills/CONVENTIONS.md for the run-folder / naming / manifest rules.
+-->
+
+```{r}
+#| label: setup
+#| include: false
+
+library(zfbehavior)
+
+p <- params
+skill <- "dataset-import-qc"
+
+stop_param <- function(msg) {
+  stop("dataset-import-qc parameter error: ", msg, call. = FALSE)
+}
+
+if (is.null(p$run_label) || !grepl("^[A-Za-z0-9_-]+$", p$run_label)) {
+  stop_param("`run_label` is required (letters, digits, '-', '_').")
+}
+if (is.null(p$column_mapping) || length(p$column_mapping) == 0) {
+  stop_param("`column_mapping` is required (confirm it with the user).")
+}
+if (is.null(p$input)) stop_param("`input` is required.")
+for (nm in c("expected_row_count", "expected_vc_wells", "expected_dose_wells")) {
+  if (is.null(p$plate_qc[[nm]])) {
+    stop_param(paste0("`plate_qc$", nm, "` is required (no default is assumed)."))
+  }
+}
+if (!is.null(p$input$format) &&
+    !p$input$format %in% c("one_file_per_plate", "single_file", "sheet_per_plate")) {
+  stop_param("`input$format` must be one_file_per_plate, single_file, or sheet_per_plate.")
+}
+
+project_root <- normalizePath(p$project_root, mustWork = TRUE)
+out_dir <- "outputs"
+dir.create(out_dir, showWarnings = FALSE)
+
+out_path <- function(object, ext) {
+  file.path(out_dir, paste0(skill, "__", p$run_label, "__", object, ".", ext))
+}
+# CONVENTIONS.md section 2: every table saved to outputs/ is a tibble,
+# including tables one level inside a saved list / result object.
+save_rds <- function(x, path) {
+  as_tbl <- function(v) if (is.data.frame(v) && !inherits(v, "tbl_df")) tibble::as_tibble(v) else v
+  x <- as_tbl(x)
+  if (is.list(x) && !is.data.frame(x)) {
+    cls <- class(x)
+    x[] <- lapply(x, as_tbl)
+    class(x) <- cls
+  }
+  saveRDS(x, path)
+}
+
+as_chr <- function(x) if (is.null(x)) character(0) else unlist(x, use.names = FALSE)
+
+# Quarto may deliver a yml list of maps as a data.frame or a list of lists;
+# normalize to a data.frame with the requested character columns.
+as_entry_table <- function(x, cols, what) {
+  empty <- as.data.frame(
+    stats::setNames(rep(list(character(0)), length(cols)), cols),
+    stringsAsFactors = FALSE
+  )
+  if (is.null(x) || length(x) == 0) return(empty)
+  get_col <- function(nm) {
+    if (is.data.frame(x)) {
+      v <- x[[nm]]
+      if (is.null(v)) rep(NA_character_, nrow(x)) else as.character(v)
+    } else {
+      vapply(x, function(e) {
+        if (is.null(e[[nm]])) NA_character_ else as.character(e[[nm]])
+      }, "")
+    }
+  }
+  out <- as.data.frame(stats::setNames(lapply(cols, get_col), cols), stringsAsFactors = FALSE)
+  for (nm in cols) {
+    v <- out[[nm]]
+    if (any(is.na(v) | !nzchar(trimws(v)))) {
+      stop_param(paste0("every `", what, "` entry needs a non-empty `", nm, "`."))
+    }
+  }
+  out
+}
+
+well_cols <- c("plate_id", "well_id", "reason")
+well_key <- function(df) paste(df$plate_id, df$well_id, sep = "@@")
+
+check_no_dup_wells <- function(tbl, what) {
+  dup <- unique(well_key(tbl)[duplicated(well_key(tbl))])
+  if (length(dup) > 0) {
+    stop_param(paste0("`", what, "` lists a well more than once: ",
+                      paste(sub("@@", "/", dup), collapse = ", ")))
+  }
+}
+
+kw_source <- if (is.null(p$keep_well$source)) "column" else as.character(p$keep_well$source)
+if (!kw_source %in% c("column", "derived")) {
+  stop_param("`keep_well$source` must be `column` or `derived`.")
+}
+false_wells_tbl <- as_entry_table(p$keep_well$false_wells, well_cols, "keep_well$false_wells")
+if (kw_source == "column" && nrow(false_wells_tbl) > 0) {
+  stop_param("`keep_well$false_wells` is only used with `keep_well$source: derived`.")
+}
+if (kw_source == "derived") {
+  if (!is.null(p$column_mapping$keep_well)) {
+    stop_param("with `keep_well$source: derived`, do not map keep_well in `column_mapping`.")
+  }
+  if (!"keep_well" %in% as_chr(p$optional_roles)) {
+    stop_param("with `keep_well$source: derived`, add keep_well to `optional_roles`.")
+  }
+}
+provider_removed_tbl <- as_entry_table(p$provider_removed_wells, well_cols, "provider_removed_wells")
+remove_wells_tbl <- as_entry_table(p$remove_wells, well_cols, "remove_wells")
+keep_flagged_tbl <- as_entry_table(p$keep_flagged_wells, well_cols, "keep_flagged_wells")
+check_no_dup_wells(false_wells_tbl, "keep_well$false_wells")
+check_no_dup_wells(provider_removed_tbl, "provider_removed_wells")
+check_no_dup_wells(remove_wells_tbl, "remove_wells")
+check_no_dup_wells(keep_flagged_tbl, "keep_flagged_wells")
+both_lists <- intersect(well_key(remove_wells_tbl), well_key(keep_flagged_tbl))
+if (length(both_lists) > 0) {
+  stop_param(paste0("well(s) listed in both `remove_wells` and `keep_flagged_wells`: ",
+                    paste(sub("@@", "/", both_lists), collapse = ", ")))
+}
+flag_col <- p$flag_comment_column
+flag_pattern <- p$flag_comment_pattern
+if (xor(is.null(flag_col), is.null(flag_pattern))) {
+  stop_param("`flag_comment_column` and `flag_comment_pattern` must be given together.")
+}
+```
+
+## Run
+
+- Skill: `dataset-import-qc`
+- Run label: **`r p$run_label`**
+- zfbehavior version: `r as.character(utils::packageVersion("zfbehavior"))`
+- Rendered: `r format(Sys.time(), "%Y-%m-%d %H:%M:%S")`
+
+## Inputs
+
+```{r}
+#| label: resolve-inputs
+
+resolve_from_root <- function(x) {
+  ifelse(grepl("^(/|~|[A-Za-z]:)", x), path.expand(x), file.path(project_root, x))
+}
+
+input_files <- character(0)
+if (length(as_chr(p$input$files)) > 0) {
+  input_files <- resolve_from_root(as_chr(p$input$files))
+}
+if (!is.null(p$input$pattern)) {
+  pat_dir <- resolve_from_root(dirname(p$input$pattern))
+  pat_glob <- utils::glob2rx(basename(p$input$pattern))
+  input_files <- c(input_files, list.files(pat_dir, pattern = pat_glob, full.names = TRUE))
+}
+# Keep paths as given relative to the project root (do NOT resolve symlinks,
+# e.g. data/raw/<batch> linked to shared storage), so the manifest records
+# project-relative input paths.
+input_files <- sort(unique(input_files))
+
+if (length(input_files) == 0) {
+  stop_param("no input files found (check `input$files` / `input$pattern`).")
+}
+missing_files <- input_files[!file.exists(input_files)]
+if (length(missing_files) > 0) {
+  stop_param(paste0("input file(s) not found: ", paste(missing_files, collapse = ", ")))
+}
+
+input_format <- if (is.null(p$input$format)) "one_file_per_plate" else p$input$format
+
+# One "read unit" per file, or per file x sheet for sheet_per_plate.
+read_units <- if (input_format == "sheet_per_plate") {
+  do.call(rbind, lapply(input_files, function(f) {
+    sheets <- as_chr(p$input$sheets)
+    if (length(sheets) == 0) sheets <- readxl::excel_sheets(f)
+    data.frame(file = f, sheet = sheets, stringsAsFactors = FALSE)
+  }))
+} else {
+  sheet1 <- as_chr(p$input$sheets)
+  data.frame(
+    file = input_files,
+    sheet = if (length(sheet1) > 0) sheet1[[1]] else NA_character_,
+    stringsAsFactors = FALSE
+  )
+}
+
+knitr::kable(
+  data.frame(
+    format = input_format,
+    n_files = length(input_files),
+    n_read_units = nrow(read_units)
+  ),
+  caption = "Input summary."
+)
+```
+
+## Import
+
+Each read unit is imported with `read_behavior_data()` (strict parsing:
+any parse/coercion problem is an error, recorded per file rather than
+stopping the whole run).
+
+```{r}
+#| label: import
+
+col_types <- as_chr(p$col_types)
+optional_roles <- as_chr(p$optional_roles)
+dtv <- p$derive_time_value_from_binning
+# YAML 1.1 writers may emit yes/no, which Quarto passes through as strings.
+if (is.character(dtv) && tolower(dtv) %in% c("yes", "true", "on")) dtv <- TRUE
+if (is.character(dtv) && tolower(dtv) %in% c("no", "false", "off")) dtv <- FALSE
+derive_time <- isTRUE(dtv) || is.character(dtv)
+binning_col <- if (is.character(dtv)) dtv else "BINNING"
+
+import_one <- function(file, sheet) {
+  ext <- tolower(tools::file_ext(file))
+  is_excel <- ext %in% c("xlsx", "xls")
+  args <- list(
+    path = file,
+    column_mapping = p$column_mapping,
+    optional_roles = if (length(optional_roles) > 0) optional_roles else NULL
+  )
+  if (is_excel) {
+    if (!is.na(sheet)) args$sheet <- sheet
+    if (length(col_types) > 0) args$excel_col_types <- col_types
+  } else if (length(col_types) > 0) {
+    # Same yml vocabulary as Excel (text/numeric/logical) -> readr compact codes.
+    codes <- c(text = "c", numeric = "d", logical = "l")[col_types]
+    if (anyNA(codes)) {
+      stop_param("`col_types` for CSV/TSV input may only use text, numeric, logical.")
+    }
+    args$delimited_col_types <- paste(unname(codes), collapse = "")
+  }
+  d <- do.call(read_behavior_data, args)
+  if (derive_time) {
+    if (!binning_col %in% names(d)) {
+      stop("time-bin column `", binning_col, "` not found in ", basename(file), call. = FALSE)
+    }
+    d$time_value <- parse_binning_to_time(d[[binning_col]])
+  }
+  d$source_file <- basename(file)
+  if (!is.na(sheet)) d$source_sheet <- sheet
+  d
+}
+
+imports <- lapply(seq_len(nrow(read_units)), function(i) {
+  u <- read_units[i, ]
+  res <- tryCatch(import_one(u$file, u$sheet), error = function(e) e)
+  list(file = basename(u$file), sheet = u$sheet, result = res)
+})
+
+import_log <- data.frame(
+  file = vapply(imports, `[[`, "", "file"),
+  sheet = vapply(imports, function(x) as.character(x$sheet), ""),
+  ok = vapply(imports, function(x) !inherits(x$result, "error"), TRUE),
+  n_rows = vapply(imports, function(x) {
+    if (inherits(x$result, "error")) NA_integer_ else nrow(x$result)
+  }, 1L),
+  error = vapply(imports, function(x) {
+    if (inherits(x$result, "error")) {
+      paste0("[", class(x$result)[1], "] ", conditionMessage(x$result))
+    } else {
+      ""
+    }
+  }, ""),
+  stringsAsFactors = FALSE
+)
+
+knitr::kable(import_log, caption = "Import log (one row per read unit).")
+```
+
+## Per-plate QC
+
+Data are split by `plate_id` (even within a single file) and each plate is
+checked with `validate_behavior_data()` using the expected counts from the
+run's yml.
+
+```{r}
+#| label: per-plate-qc
+
+imported <- do.call(
+  rbind,
+  lapply(Filter(function(x) !inherits(x$result, "error"), imports), function(x) {
+    as.data.frame(x$result)
+  })
+)
+imported <- if (is.null(imported)) NULL else tibble::as_tibble(imported)
+
+# keep_well source: derived -> FALSE only for the user-listed wells.
+if (!is.null(imported) && kw_source == "derived") {
+  if ("keep_well" %in% names(imported)) {
+    stop_param("`keep_well$source: derived`, but the imported data already has a keep_well column.")
+  }
+  present_keys <- unique(well_key(imported))
+  unknown_fw <- setdiff(well_key(false_wells_tbl), present_keys)
+  if (length(unknown_fw) > 0) {
+    stop_param(paste0("`keep_well$false_wells` lists well(s) not in the data: ",
+                      paste(sub("@@", "/", unknown_fw), collapse = ", ")))
+  }
+  imported$keep_well <- !(well_key(imported) %in% well_key(false_wells_tbl))
+}
+
+plate_results <- list()
+if (!is.null(imported)) {
+  for (pid in sort(unique(imported$plate_id))) {
+    d_plate <- imported[imported$plate_id %in% pid, , drop = FALSE]
+    qc <- validate_behavior_data(
+      d_plate,
+      expected_row_count = p$plate_qc$expected_row_count,
+      expected_vc_wells = p$plate_qc$expected_vc_wells,
+      expected_dose_wells = p$plate_qc$expected_dose_wells
+    )
+    plate_results[[as.character(pid)]] <- qc
+  }
+}
+
+plate_qc_table <- do.call(rbind, lapply(names(plate_results), function(pid) {
+  qc <- plate_results[[pid]]
+  bad <- qc$checks[qc$checks$status != "passed", , drop = FALSE]
+  data.frame(
+    plate_id = pid,
+    source_file = paste(unique(imported$source_file[imported$plate_id %in% pid]), collapse = "; "),
+    ok = qc$ok,
+    issues = if (nrow(bad) == 0) "" else paste0(
+      "[", bad$status, "] ", bad$code, ": ", bad$message, collapse = " | "
+    ),
+    accepted_with_provider_removed_wells = FALSE,
+    stringsAsFactors = FALSE
+  )
+}))
+if (is.null(plate_qc_table)) {
+  plate_qc_table <- data.frame(
+    plate_id = character(0), source_file = character(0),
+    ok = logical(0), issues = character(0),
+    accepted_with_provider_removed_wells = logical(0)
+  )
+}
+
+# Provider-removed wells: a plate is accepted only if (a) every declared well
+# is absent, (b) its ONLY failed checks are the count checks, and (c) the
+# row/VC/dose shortfalls are explained exactly by the declared wells.
+count_codes <- c("plate_row_counts", "vc_replicate_counts", "dose_replicate_counts")
+provider_removed_check <- data.frame(
+  plate_id = character(0), n_declared = integer(0), accepted = logical(0),
+  detail = character(0), stringsAsFactors = FALSE
+)
+if (nrow(provider_removed_tbl) > 0) {
+  unknown_pr <- setdiff(provider_removed_tbl$plate_id, plate_qc_table$plate_id)
+  if (length(unknown_pr) > 0) {
+    stop_param(paste0("`provider_removed_wells` lists unknown plate_id(s): ",
+                      paste(unknown_pr, collapse = ", ")))
+  }
+  n_time <- length(unique(imported$time_value))
+  for (pid in unique(provider_removed_tbl$plate_id)) {
+    decl <- provider_removed_tbl[provider_removed_tbl$plate_id == pid, , drop = FALSE]
+    d_plate <- imported[imported$plate_id %in% pid, , drop = FALSE]
+    qc <- plate_results[[pid]]
+    problems <- character(0)
+
+    still_present <- intersect(well_key(decl), unique(well_key(d_plate)))
+    if (length(still_present) > 0) {
+      problems <- c(problems, paste0("declared-removed well(s) still present: ",
+                                     paste(sub("^.*@@", "", still_present), collapse = ", ")))
+    }
+    other_fail <- qc$checks$code[qc$checks$status != "passed" & !qc$checks$code %in% count_codes]
+    if (length(other_fail) > 0) {
+      problems <- c(problems, paste0("non-count check(s) failed: ", paste(other_fail, collapse = ", ")))
+    }
+    n_wells_present <- length(unique(d_plate$well_id))
+    exp_rows <- p$plate_qc$expected_row_count
+    if (nrow(d_plate) != exp_rows - nrow(decl) * n_time) {
+      problems <- c(problems, paste0(
+        "row count ", nrow(d_plate), " != expected ", exp_rows, " - ",
+        nrow(decl), " declared well(s) x ", n_time, " timepoints"
+      ))
+    }
+    if (exp_rows %% n_time == 0 && n_wells_present != exp_rows / n_time - nrow(decl)) {
+      problems <- c(problems, paste0(
+        n_wells_present, " wells present, expected ", exp_rows / n_time - nrow(decl)
+      ))
+    }
+    # VC / dose shortfall: every stratum below the expected count must be
+    # explained by declared wells. The declared wells' own design (VC vs dose)
+    # is unknown because they are absent, so compare totals per plate.
+    vc_diag <- qc$diagnostics$vc_replicate_counts
+    dose_diag <- qc$diagnostics$dose_replicate_counts
+    vc_short <- if (is.null(vc_diag)) 0 else
+      sum(pmax(0, p$plate_qc$expected_vc_wells - vc_diag$n_vc_wells)) / n_time
+    dose_short <- if (is.null(dose_diag)) 0 else
+      sum(pmax(0, p$plate_qc$expected_dose_wells - dose_diag$n_wells)) / n_time
+    vc_over <- if (is.null(vc_diag)) 0 else sum(vc_diag$n_vc_wells > p$plate_qc$expected_vc_wells)
+    dose_over <- if (is.null(dose_diag)) 0 else sum(dose_diag$n_wells > p$plate_qc$expected_dose_wells)
+    if (vc_over + dose_over > 0) {
+      problems <- c(problems, "some VC/dose strata have MORE wells than expected")
+    }
+    if (vc_short + dose_short != nrow(decl)) {
+      problems <- c(problems, paste0(
+        "VC + dose well shortfall (", vc_short, " + ", dose_short,
+        ") != ", nrow(decl), " declared well(s)"
+      ))
+    }
+    accepted <- length(problems) == 0
+    provider_removed_check <- rbind(provider_removed_check, data.frame(
+      plate_id = pid, n_declared = nrow(decl), accepted = accepted,
+      detail = if (accepted) {
+        paste0("shortfall explained: ", vc_short, " VC + ", dose_short, " dose well(s)")
+      } else {
+        paste(problems, collapse = "; ")
+      },
+      stringsAsFactors = FALSE
+    ))
+    if (accepted && !plate_qc_table$ok[plate_qc_table$plate_id == pid]) {
+      plate_qc_table$ok[plate_qc_table$plate_id == pid] <- TRUE
+      plate_qc_table$accepted_with_provider_removed_wells[plate_qc_table$plate_id == pid] <- TRUE
+    }
+  }
+  if (any(!provider_removed_check$accepted)) {
+    # A declaration that does not match the data is a review item, not an
+    # automatic acceptance: mark those plates as failed.
+    bad_pr <- provider_removed_check$plate_id[!provider_removed_check$accepted]
+    plate_qc_table$ok[plate_qc_table$plate_id %in% bad_pr] <- FALSE
+    plate_qc_table$issues[plate_qc_table$plate_id %in% bad_pr] <- paste0(
+      plate_qc_table$issues[plate_qc_table$plate_id %in% bad_pr],
+      " | provider_removed_wells declaration does not match: ",
+      provider_removed_check$detail[match(plate_qc_table$plate_id[plate_qc_table$plate_id %in% bad_pr],
+                                          provider_removed_check$plate_id)]
+    )
+  }
+}
+
+knitr::kable(
+  data.frame(
+    plates = nrow(plate_qc_table),
+    passed = sum(plate_qc_table$ok),
+    failed = sum(!plate_qc_table$ok),
+    import_errors = sum(!import_log$ok)
+  ),
+  caption = "Per-plate QC summary."
+)
+```
+
+```{r}
+#| label: failed-plates
+
+failed_plates <- plate_qc_table[!plate_qc_table$ok, , drop = FALSE]
+if (nrow(failed_plates) > 0) {
+  knitr::kable(failed_plates, caption = "Plates that FAILED per-plate QC.")
+} else {
+  cat("All plates passed per-plate QC.\n")
+}
+```
+
+```{r}
+#| label: provider-removed
+
+if (nrow(provider_removed_check) > 0) {
+  knitr::kable(
+    provider_removed_check,
+    caption = paste(
+      "Plates with wells the provider already removed (declared in",
+      "`provider_removed_wells`). Accepted only when the count shortfall",
+      "matches the declaration exactly and no other check failed."
+    )
+  )
+}
+```
+
+## Exclusions (human decision)
+
+```{r}
+#| label: exclusions
+
+excl <- p$exclude_plates
+# Quarto may deliver a yml list of {plate_id, reason} maps either as a
+# data.frame or as a list of lists -- normalize both.
+excl_table <- if (is.null(excl) || length(excl) == 0) {
+  data.frame(plate_id = character(0), reason = character(0))
+} else if (is.data.frame(excl)) {
+  data.frame(
+    plate_id = as.character(excl$plate_id),
+    reason = if (is.null(excl$reason)) NA_character_ else as.character(excl$reason),
+    stringsAsFactors = FALSE
+  )
+} else {
+  data.frame(
+    plate_id = vapply(excl, function(x) as.character(x$plate_id), ""),
+    reason = vapply(excl, function(x) {
+      if (is.null(x$reason)) NA_character_ else as.character(x$reason)
+    }, ""),
+    stringsAsFactors = FALSE
+  )
+}
+if (nrow(excl_table) > 0 && any(is.na(excl_table$plate_id) | !nzchar(excl_table$plate_id))) {
+  stop_param("every `exclude_plates` entry needs a `plate_id`.")
+}
+excl_table$reason[!is.na(excl_table$reason) & !nzchar(trimws(excl_table$reason))] <- NA_character_
+if (any(is.na(excl_table$reason))) {
+  stop_param("every `exclude_plates` entry needs a non-empty `reason`.")
+}
+unknown_excl <- setdiff(excl_table$plate_id, plate_qc_table$plate_id)
+if (length(unknown_excl) > 0) {
+  stop_param(paste0("`exclude_plates` lists unknown plate_id(s): ", paste(unknown_excl, collapse = ", ")))
+}
+
+unresolved <- setdiff(failed_plates$plate_id, excl_table$plate_id)
+
+if (nrow(excl_table) > 0) {
+  knitr::kable(excl_table, caption = "Plates excluded by user decision (from the run's yml).")
+} else {
+  cat("No plates excluded.\n")
+}
+```
+
+## Well curation (exactly one larva per well)
+
+The combined output must contain only wells holding exactly one larva, so
+that `keep_well = FALSE` means "one larva, dead/malformed" and every well in
+the output counts toward the denominator. `keep_well` source:
+**`r kw_source`**.
+
+```{r}
+#| label: well-curation
+
+well_info_cols <- intersect(
+  c("plate_id", "well_id", "is_vehicle_control", "concentration", "keep_well", flag_col),
+  names(imported)
+)
+well_info <- if (is.null(imported)) {
+  data.frame(plate_id = character(0), well_id = character(0), stringsAsFactors = FALSE)
+} else {
+  unique(imported[, well_info_cols, drop = FALSE])
+}
+if (anyDuplicated(well_key(well_info))) {
+  # A flag/comment column that varies within a well: keep the first value per
+  # well for display (per-plate QC already reports well-level invariants).
+  well_info <- well_info[!duplicated(well_key(well_info)), , drop = FALSE]
+}
+present_keys <- well_key(well_info)
+
+unknown_rm <- setdiff(well_key(remove_wells_tbl), present_keys)
+if (length(unknown_rm) > 0) {
+  stop_param(paste0("`remove_wells` lists well(s) not in the data: ",
+                    paste(sub("@@", "/", unknown_rm), collapse = ", ")))
+}
+unknown_kf <- setdiff(well_key(keep_flagged_tbl), present_keys)
+if (length(unknown_kf) > 0) {
+  stop_param(paste0("`keep_flagged_wells` lists well(s) not in the data: ",
+                    paste(sub("@@", "/", unknown_kf), collapse = ", ")))
+}
+
+# Candidate finder (never removes anything by itself).
+flagged <- well_info[0, , drop = FALSE]
+if (!is.null(flag_col) && !is.null(imported)) {
+  if (!flag_col %in% names(imported)) {
+    stop_param(paste0("`flag_comment_column` `", flag_col, "` not found in the imported data."))
+  }
+  hit <- !is.na(well_info[[flag_col]]) &
+    grepl(flag_pattern, well_info[[flag_col]], ignore.case = TRUE)
+  flagged <- well_info[hit, , drop = FALSE]
+}
+flagged$resolution <- ifelse(
+  well_key(flagged) %in% well_key(remove_wells_tbl), "removed",
+  ifelse(well_key(flagged) %in% well_key(keep_flagged_tbl), "kept (confirmed one larva)", "UNRESOLVED")
+)
+flagged$resolution[flagged$resolution == "UNRESOLVED" &
+                     flagged$plate_id %in% excl_table$plate_id] <- "plate excluded"
+unresolved_flagged <- flagged[flagged$resolution == "UNRESOLVED", , drop = FALSE]
+
+if (!is.null(flag_col)) {
+  cat("Comment flag: column `", flag_col, "`, pattern `", flag_pattern, "` -> ",
+      nrow(flagged), " well(s) flagged, ", nrow(unresolved_flagged), " unresolved.\n", sep = "")
+  if (nrow(flagged) > 0) {
+    knitr::kable(flagged[order(flagged$resolution != "UNRESOLVED", flagged$plate_id, flagged$well_id), ],
+                 row.names = FALSE, caption = "Wells flagged by the comment pattern.")
+  }
+} else {
+  cat("No comment flag configured.\n")
+}
+```
+
+```{r}
+#| label: removed-wells-table
+
+removed_detail <- if (nrow(remove_wells_tbl) > 0) {
+  merge(remove_wells_tbl, well_info, by = c("plate_id", "well_id"), all.x = TRUE, sort = TRUE)
+} else {
+  NULL
+}
+if (!is.null(removed_detail)) {
+  knitr::kable(removed_detail, row.names = FALSE,
+               caption = "Wells removed from the output (`remove_wells`, user decision).")
+} else {
+  cat("No wells removed (`remove_wells` is empty).\n")
+}
+if (nrow(keep_flagged_tbl) > 0) {
+  knitr::kable(keep_flagged_tbl, row.names = FALSE,
+               caption = "Flagged wells confirmed as exactly one larva (`keep_flagged_wells`).")
+}
+if (kw_source == "derived") {
+  knitr::kable(false_wells_tbl, row.names = FALSE,
+                caption = "keep_well derived: wells set to FALSE (`keep_well$false_wells`); all others TRUE.")
+}
+```
+
+## Vehicle-control usability per plate
+
+Per plate, after well curation: kept vehicle-control wells / vehicle-control
+wells present. A plate with **no** kept vehicle-control well is always
+flagged (it cannot take part in any vehicle-control comparison or
+normalization); with `min_kept_vc_pct` set, a plate below that percentage is
+flagged too. Each flagged plate must be excluded or accepted (with a reason).
+
+```{r}
+#| label: vc-usability
+
+min_vc_pct <- p$min_kept_vc_pct
+if (!is.null(min_vc_pct)) {
+  min_vc_pct <- suppressWarnings(as.numeric(min_vc_pct))
+  if (length(min_vc_pct) != 1 || !is.finite(min_vc_pct) || min_vc_pct < 0 || min_vc_pct > 100) {
+    stop_param("`min_kept_vc_pct` must be a number between 0 and 100 (or null).")
+  }
+}
+accept_low_vc_tbl <- as_entry_table(p$accept_low_vc_plates, c("plate_id", "reason"), "accept_low_vc_plates")
+if (anyDuplicated(accept_low_vc_tbl$plate_id)) {
+  stop_param("`accept_low_vc_plates` lists a plate more than once.")
+}
+
+vc_usability <- data.frame(
+  plate_id = character(0), n_vc_wells = integer(0), n_vc_kept = integer(0),
+  pct_vc_kept = numeric(0), flagged = logical(0), stringsAsFactors = FALSE
+)
+if (!is.null(imported)) {
+  wl <- unique(imported[!well_key(imported) %in% well_key(remove_wells_tbl),
+                        c("plate_id", "well_id", "is_vehicle_control", "keep_well")])
+  pids <- sort(unique(wl$plate_id))
+  n_vc <- vapply(pids, function(x) sum(wl$plate_id == x & wl$is_vehicle_control), 1L)
+  n_vc_kept <- vapply(pids, function(x) sum(wl$plate_id == x & wl$is_vehicle_control & wl$keep_well), 1L)
+  pct <- ifelse(n_vc > 0, n_vc_kept / n_vc * 100, 0)
+  vc_usability <- data.frame(
+    plate_id = pids, n_vc_wells = unname(n_vc), n_vc_kept = unname(n_vc_kept),
+    pct_vc_kept = round(unname(pct), 2),
+    flagged = unname(n_vc_kept == 0 | (if (is.null(min_vc_pct)) FALSE else pct < min_vc_pct)),
+    stringsAsFactors = FALSE
+  )
+}
+unknown_alv <- setdiff(accept_low_vc_tbl$plate_id, vc_usability$plate_id)
+if (length(unknown_alv) > 0) {
+  stop_param(paste0("`accept_low_vc_plates` lists unknown plate_id(s): ", paste(unknown_alv, collapse = ", ")))
+}
+zero_vc_accepted <- intersect(accept_low_vc_tbl$plate_id, vc_usability$plate_id[vc_usability$n_vc_kept == 0])
+if (length(zero_vc_accepted) > 0) {
+  stop_param(paste0("plate(s) with NO kept vehicle-control well cannot be accepted, only excluded: ",
+                    paste(zero_vc_accepted, collapse = ", ")))
+}
+vc_usability$resolution <- ifelse(
+  !vc_usability$flagged, "",
+  ifelse(vc_usability$plate_id %in% excl_table$plate_id, "plate excluded",
+         ifelse(vc_usability$plate_id %in% accept_low_vc_tbl$plate_id, "accepted", "UNRESOLVED"))
+)
+unresolved_low_vc <- vc_usability$plate_id[vc_usability$resolution == "UNRESOLVED"]
+
+if (nrow(vc_usability) > 0) {
+  knitr::kable(data.frame(
+    plates = nrow(vc_usability),
+    threshold_pct = if (is.null(min_vc_pct)) "none (zero kept VC only)" else as.character(min_vc_pct),
+    min_pct = min(vc_usability$pct_vc_kept),
+    median_pct = stats::median(vc_usability$pct_vc_kept),
+    flagged = sum(vc_usability$flagged),
+    unresolved = length(unresolved_low_vc)
+  ), caption = "Kept vehicle-control wells per plate (after well curation).")
+}
+```
+
+```{r}
+#| label: vc-usability-flagged
+
+flagged_vc <- vc_usability[vc_usability$flagged, , drop = FALSE]
+if (nrow(flagged_vc) > 0) {
+  flagged_vc <- merge(flagged_vc, accept_low_vc_tbl, by = "plate_id", all.x = TRUE)
+  knitr::kable(flagged_vc, row.names = FALSE,
+               caption = "Plates flagged for too few kept vehicle-control wells.")
+} else {
+  cat("No plate flagged for kept vehicle-control wells.\n")
+}
+```
+
+## Status
+
+```{r}
+#| label: status
+
+if (sum(import_log$ok) == 0) {
+  status <- "failed"
+  status_reason <- "No input could be imported; see the import log."
+} else if (any(!import_log$ok)) {
+  status <- "needs_review"
+  status_reason <- paste0(
+    sum(!import_log$ok), " read unit(s) failed to import. Fix the source file(s) or ",
+    "remove them from `input` in the yml, then re-render."
+  )
+} else if (length(unresolved) > 0) {
+  status <- "needs_review"
+  status_reason <- paste0(
+    length(unresolved), " plate(s) failed per-plate QC and are not excluded: ",
+    paste(unresolved, collapse = ", "),
+    ". Review the diagnostics, then either fix the source data, declare wells the ",
+    "provider already removed in `provider_removed_wells`, or add the plate(s) ",
+    "to `exclude_plates` (with a reason) in the yml, and re-render."
+  )
+} else if (nrow(unresolved_flagged) > 0) {
+  status <- "needs_review"
+  status_reason <- paste0(
+    nrow(unresolved_flagged), " well(s) flagged by the comment pattern are unresolved: ",
+    paste(paste0(unresolved_flagged$plate_id, "/", unresolved_flagged$well_id), collapse = ", "),
+    ". For each, add it to `remove_wells` (no larva / multiple larvae / technical failure) ",
+    "or `keep_flagged_wells` (exactly one larva), with a reason, and re-render."
+  )
+} else if (length(unresolved_low_vc) > 0) {
+  status <- "needs_review"
+  status_reason <- paste0(
+    length(unresolved_low_vc), " plate(s) have too few kept vehicle-control wells: ",
+    paste(unresolved_low_vc, collapse = ", "),
+    ". For each, add it to `exclude_plates` or `accept_low_vc_plates` (with a reason; ",
+    "plates with no kept vehicle-control well can only be excluded), and re-render."
+  )
+} else {
+  status <- "pending_dataset_qc"
+  status_reason <- ""
+}
+```
+
+```{r}
+#| label: combine-and-dataset-qc
+
+combined <- NULL
+dataset_qc <- NULL
+if (status == "pending_dataset_qc") {
+  keep_ids <- setdiff(plate_qc_table$plate_id, excl_table$plate_id)
+  combined <- imported[imported$plate_id %in% keep_ids, , drop = FALSE]
+  n_rows_before_well_removal <- nrow(combined)
+  combined <- combined[!well_key(combined) %in% well_key(remove_wells_tbl), , drop = FALSE]
+
+  unique_id_cols <- as_chr(p$dataset_qc$unique_id_cols)
+  expected_n_distinct <- if (is.null(p$dataset_qc$expected_n_distinct)) {
+    list()
+  } else {
+    lapply(p$dataset_qc$expected_n_distinct, as.integer)
+  }
+  dataset_qc <- validate_combined_dataset(
+    combined,
+    unique_id_cols = unique_id_cols,
+    plate_col = "plate_id",
+    expected_n_distinct = expected_n_distinct
+  )
+  print(dataset_qc)
+
+  if (isTRUE(dataset_qc$ok)) {
+    status <- "complete"
+    status_reason <- paste0(
+      length(keep_ids), " plate(s) combined; ", nrow(excl_table), " excluded by user decision; ",
+      nrow(remove_wells_tbl), " well(s) removed; ", nrow(provider_removed_tbl),
+      " well(s) declared removed by the provider."
+    )
+  } else {
+    status <- "needs_review"
+    status_reason <- paste0(
+      "Dataset-level QC failed (see checks above). Resolve the identifier/count ",
+      "problem (or correct the expected values in the yml if they were wrong) and re-render."
+    )
+  }
+}
+```
+
+```{r}
+#| label: well-counts-per-plate
+
+well_counts_per_plate <- NULL
+if (!is.null(combined) && identical(status, "complete")) {
+  wl <- unique(combined[, c("plate_id", "well_id", "keep_well")])
+  delivered <- tapply(well_info$well_id, well_info$plate_id, length)
+  well_counts_per_plate <- data.frame(
+    plate_id = sort(unique(wl$plate_id)),
+    stringsAsFactors = FALSE
+  )
+  pid <- well_counts_per_plate$plate_id
+  well_counts_per_plate$n_wells_delivered <- as.integer(delivered[pid])
+  well_counts_per_plate$n_provider_removed <- as.integer(
+    vapply(pid, function(x) sum(provider_removed_tbl$plate_id == x), 1L)
+  )
+  well_counts_per_plate$n_removed <- as.integer(
+    vapply(pid, function(x) sum(remove_wells_tbl$plate_id == x), 1L)
+  )
+  well_counts_per_plate$n_wells_output <- as.integer(table(wl$plate_id)[pid])
+  well_counts_per_plate$n_keep_well_false <- as.integer(
+    vapply(pid, function(x) sum(!wl$keep_well[wl$plate_id == x]), 1L)
+  )
+  affected <- well_counts_per_plate[
+    well_counts_per_plate$n_provider_removed > 0 | well_counts_per_plate$n_removed > 0, , drop = FALSE
+  ]
+  knitr::kable(
+    data.frame(
+      plates = nrow(well_counts_per_plate),
+      wells_output = sum(well_counts_per_plate$n_wells_output),
+      wells_removed = sum(well_counts_per_plate$n_removed),
+      wells_provider_removed = sum(well_counts_per_plate$n_provider_removed),
+      keep_well_false = sum(well_counts_per_plate$n_keep_well_false),
+      rows_output = nrow(combined)
+    ),
+    caption = "Output well counts (every output well holds exactly one larva)."
+  )
+}
+```
+
+```{r}
+#| label: well-counts-affected
+
+if (!is.null(well_counts_per_plate) && nrow(affected) > 0) {
+  knitr::kable(affected, row.names = FALSE,
+               caption = "Plates with removed or provider-removed wells.")
+}
+```
+
+```{r}
+#| label: concentration-units
+
+# Report only (no status change): downstream skills that pool plates or
+# compare concentrations need to know the units. Vehicle-control wells are
+# ignored (their unit is not a dosing unit).
+conc_units <- NULL
+plates_mixed_units <- character(0)
+if (!is.null(combined) && identical(status, "complete")) {
+  if ("concentration_unit" %in% names(combined)) {
+    tw <- unique(combined[!combined$is_vehicle_control, c("plate_id", "concentration_unit")])
+    tw$concentration_unit[is.na(tw$concentration_unit)] <- "(missing)"
+    per_plate <- tapply(tw$concentration_unit, tw$plate_id, function(u) paste(sort(unique(u)), collapse = " + "))
+    plates_mixed_units <- names(per_plate)[grepl(" + ", per_plate, fixed = TRUE)]
+    conc_units <- as.data.frame(table(concentration_unit = unname(per_plate)), stringsAsFactors = FALSE)
+    names(conc_units)[2] <- "n_plates"
+    conc_units$plates <- vapply(conc_units$concentration_unit, function(u) {
+      ids <- sort(names(per_plate)[per_plate == u])
+      if (length(ids) > 12) paste0(paste(ids[1:12], collapse = ", "), ", ...") else paste(ids, collapse = ", ")
+    }, "")
+    knitr::kable(conc_units, row.names = FALSE,
+                 caption = "Concentration units of treated wells, per plate.")
+  } else {
+    cat("No `concentration_unit` column was mapped: concentration units are unknown.\n")
+  }
+}
+```
+
+```{r}
+#| label: concentration-units-note
+
+if (!is.null(conc_units)) {
+  if (length(plates_mixed_units) > 0) {
+    cat("WARNING: plate(s) with more than one concentration unit among treated wells:",
+        paste(plates_mixed_units, collapse = ", "), "\n")
+  } else if (nrow(conc_units) > 1) {
+    cat("More than one concentration unit across plates. Plates in different units",
+        "cannot be pooled or compared on one concentration axis.\n")
+  } else {
+    cat("All plates use one concentration unit.\n")
+  }
+}
+```
+
+**Status: `r status`.** `r status_reason`
+
+## Save outputs
+
+```{r}
+#| label: save
+
+# Remove stale downstream-facing output from a previous pass of this run.
+combined_path <- out_path("combined", "rds")
+if (file.exists(combined_path)) file.remove(combined_path)
+
+save_rds(
+  list(import_log = import_log, plate_qc_table = plate_qc_table, plate_results = plate_results),
+  out_path("plate-qc", "rds")
+)
+save_rds(dataset_qc, out_path("dataset-qc", "rds"))
+save_rds(
+  list(
+    keep_well_source = kw_source,
+    keep_well_false_wells = false_wells_tbl,
+    provider_removed_wells = provider_removed_tbl,
+    provider_removed_check = provider_removed_check,
+    remove_wells = remove_wells_tbl,
+    removed_detail = removed_detail,
+    keep_flagged_wells = keep_flagged_tbl,
+    flag_comment_column = flag_col,
+    flag_comment_pattern = flag_pattern,
+    flagged = flagged,
+    well_counts_per_plate = well_counts_per_plate,
+    vc_usability = vc_usability,
+    concentration_units = conc_units,
+    min_kept_vc_pct = min_vc_pct,
+    accept_low_vc_plates = accept_low_vc_tbl
+  ),
+  out_path("well-curation", "rds")
+)
+if (identical(status, "complete")) {
+  save_rds(combined, combined_path)
+}
+
+outputs <- c(out_path("plate-qc", "rds"), out_path("dataset-qc", "rds"),
+             out_path("well-curation", "rds"))
+if (identical(status, "complete")) outputs <- c(outputs, combined_path)
+
+md5 <- function(f) unname(tools::md5sum(f))
+rel_to_root <- function(f) {
+  # Only the project root is normalized; the file path is not (symlinked
+  # raw-data folders should still be recorded under data/raw/...).
+  prefix <- paste0(project_root, "/")
+  if (startsWith(f, prefix)) substring(f, nchar(prefix) + 1) else f
+}
+
+manifest <- list(
+  skill = skill,
+  run_label = p$run_label,
+  status = status,
+  status_reason = status_reason,
+  rendered_at = format(Sys.time(), "%Y-%m-%dT%H:%M:%S"),
+  zfbehavior_version = as.character(utils::packageVersion("zfbehavior")),
+  upstream = list(),
+  inputs = lapply(input_files, function(f) list(path = rel_to_root(f), md5 = md5(f))),
+  outputs = lapply(outputs, function(f) list(path = f, md5 = md5(f))),
+  summary = list(
+    n_plates_checked = nrow(plate_qc_table),
+    n_plates_failed = sum(!plate_qc_table$ok),
+    n_plates_excluded = nrow(excl_table),
+    n_plates_accepted_with_provider_removed_wells = sum(plate_qc_table$accepted_with_provider_removed_wells),
+    n_rows_combined = if (is.null(combined) || status != "complete") NULL else nrow(combined),
+    n_wells_combined = if (is.null(well_counts_per_plate)) NULL else
+      sum(well_counts_per_plate$n_wells_output),
+    n_wells_removed = nrow(remove_wells_tbl),
+    n_wells_flagged = nrow(flagged),
+    n_wells_flagged_unresolved = nrow(unresolved_flagged),
+    n_plates_low_vc_flagged = sum(vc_usability$flagged),
+    vc_kept_pct_min = if (nrow(vc_usability) > 0) min(vc_usability$pct_vc_kept) else NULL
+  ),
+  # Units of treated wells (report only); NULL if no concentration_unit column.
+  concentration_units = if (is.null(conc_units)) NULL else
+    lapply(seq_len(nrow(conc_units)), function(i) list(
+      unit = conc_units$concentration_unit[i], n_plates = conc_units$n_plates[i]
+    )),
+  plates_mixed_concentration_units = as.list(plates_mixed_units),
+  # Output contract (CONVENTIONS.md): every well in combined.rds holds exactly
+  # one larva; keep_well = FALSE means "one larva, dead/malformed".
+  well_contract = "single_larva_wells_only",
+  keep_well_source = kw_source,
+  # Every combined plate has >= 1 kept VC well, and >= min_kept_vc_pct unless
+  # listed in accepted_low_vc_plates.
+  min_kept_vc_pct = min_vc_pct,
+  accepted_low_vc_plates = lapply(seq_len(nrow(accept_low_vc_tbl)), function(i) as.list(accept_low_vc_tbl[i, ])),
+  excluded_plates = lapply(seq_len(nrow(excl_table)), function(i) {
+    list(plate_id = excl_table$plate_id[i], reason = excl_table$reason[i])
+  }),
+  removed_wells = lapply(seq_len(nrow(remove_wells_tbl)), function(i) as.list(remove_wells_tbl[i, ])),
+  provider_removed_wells = lapply(seq_len(nrow(provider_removed_tbl)), function(i) as.list(provider_removed_tbl[i, ])),
+  keep_flagged_wells = lapply(seq_len(nrow(keep_flagged_tbl)), function(i) as.list(keep_flagged_tbl[i, ])),
+  keep_well_false_wells = lapply(seq_len(nrow(false_wells_tbl)), function(i) as.list(false_wells_tbl[i, ])),
+  parameters = p[setdiff(names(p), c(
+    "exclude_plates", "remove_wells", "provider_removed_wells",
+    "keep_flagged_wells", "keep_well", "accept_low_vc_plates"
+  ))]
+)
+yaml::write_yaml(manifest, out_path("manifest", "yml"))
+
+knitr::kable(
+  data.frame(output = c(outputs, out_path("manifest", "yml"))),
+  caption = "Files written by this run."
+)
+```

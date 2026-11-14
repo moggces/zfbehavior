@@ -1,0 +1,51 @@
+# Parameters for one intraplate-vc-qc run.
+# Location: <project>/analysis/intraplate-vc-qc/<run_label>/intraplate-vc-qc.yml
+# Render:   quarto render intraplate-vc-qc.qmd --execute-params intraplate-vc-qc.yml
+#
+# Every value below is a scientific/study choice. Fill it in WITH the user;
+# never guess. Values marked REQUIRED have no default.
+
+# REQUIRED. Must equal this run folder's name (letters, digits, '-', '_').
+run_label: "CHANGE_ME"
+
+# Project root relative to this run folder.
+project_root: "../../.."
+
+# REQUIRED. Exactly one complete behavior-endpoints run folder (relative to
+# the project root). Plates already dropped by that run's own upstream QC
+# runs (e.g. interplate-vc-qc) are not in its endpoints and are listed as
+# context only.
+upstream:
+  - analysis/behavior-endpoints/CHANGE_ME
+
+# REQUIRED. Y-axis label of the vehicle-control traces in the QC PDF (what
+# response_value measures), e.g. "distance moved".
+response_label: "CHANGE_ME"
+
+# Plate identity in tables, hover text, PDF labels and trace-page titles:
+# these columns of the import data joined with "@",
+# e.g. [CHEMICAL_NAME, chemical_id, plate_id]. Empty = plate_id.
+title_cols: [plate_id]
+
+# Tukey-fence multiplier: a plate is flagged for an endpoint when its
+# vehicle-control baseline is outside [Q1 - k*IQR, Q3 + k*IQR] across plates.
+# 3 = far outliers (default); 1.5 = standard fence (flags many more plates).
+outlier_degree: 3
+
+# Empirical movement-similarity rule (Truong et al. 2026): flag a plate when
+# the median similarity of its vehicle-control wells (raw 0-1 scale) is below
+# this value for any similarity metric. 0.4 = very poor consistency among the
+# plate's vehicle-control larvae. null = do not apply.
+similarity_threshold: 0.4
+
+# Human decisions after the first render (status: needs_review). Every
+# flagged plate must be listed in exactly one of the two lists, with a reason:
+#   - plate_id: "77"
+#     reason: "VC traces flat in D1 only; other endpoints normal; keep"
+# Unflagged plates may also be excluded (with a reason).
+exclude_plates: []
+keep_plates: []
+
+# QC PDF page size in inches.
+pdf_width: 15
+pdf_height: 10

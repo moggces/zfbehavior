@@ -1,0 +1,122 @@
+# Parameters for one dataset-import-qc run.
+# Location: <project>/analysis/dataset-import-qc/<run_label>/dataset-import-qc.yml
+# Render:   quarto render dataset-import-qc.qmd --execute-params dataset-import-qc.yml
+#
+# Every value below is a scientific/study choice. Fill it in WITH the user;
+# never guess. Values marked REQUIRED have no default.
+
+# REQUIRED. Must equal this run folder's name (letters, digits, '-', '_').
+run_label: "CHANGE_ME"
+
+# Project root relative to this run folder (analysis/dataset-import-qc/<run>/).
+# Input paths below are resolved relative to the project root.
+project_root: "../../.."
+
+input:
+  # Either list files explicitly ...
+  files: []
+  # ... and/or give a glob (relative to project root), e.g. "data/raw/260416/*.xlsx"
+  pattern: "data/raw/CHANGE_ME/*.xlsx"
+  # one_file_per_plate | single_file | sheet_per_plate
+  # (single_file: one file holding many plates; plates are split by plate_id)
+  format: one_file_per_plate
+  # Excel only. sheet_per_plate: list sheets, or leave empty for ALL sheets.
+  # Other formats: optional single sheet name/index (default first sheet).
+  sheets: []
+
+# REQUIRED. canonical role -> provider column name. See
+# zfbehavior::canonical_behavior_roles(). Confirm with the user after
+# inspecting the input headers.
+column_mapping:
+  plate_id: CHANGE_ME
+  well_id: CHANGE_ME
+  chemical_id: CHANGE_ME
+  is_vehicle_control: CHANGE_ME
+  concentration: CHANGE_ME
+  concentration_unit: CHANGE_ME
+  response_value: CHANGE_ME
+  keep_well: CHANGE_ME
+  # time_value: CHANGE_ME   # map directly if a numeric time column exists
+
+# Required roles NOT mapped above because they are derived after import.
+# Typical: [time_value] when time is only given as a text BINNING column.
+optional_roles: [time_value]
+
+# Derive time_value from a text bin column via parse_binning_to_time().
+# true = use column "BINNING"; or give the column name; false = not needed.
+derive_time_value_from_binning: true
+
+# STRONGLY RECOMMENDED. One type per input column, in file column order.
+# Vocabulary: text | numeric | logical (Excel also allows date, guess, skip, list).
+# Leaving this empty lets the reader guess types per file, which can silently
+# turn rare text values in mostly-empty columns (e.g. COMMENTS) into NA.
+col_types: []
+
+# REQUIRED. Exact expectations per plate (no defaults are assumed).
+plate_qc:
+  expected_row_count: null   # wells x timepoints, e.g. 4800 for 96 x 50
+  expected_vc_wells: null    # vehicle-control wells per plate x timepoint, e.g. 16
+  expected_dose_wells: null  # wells per plate x chemical x concentration x timepoint, e.g. 16
+
+# Dataset-level checks on the combined data (run once, after exclusions).
+dataset_qc:
+  # Columns that must be in exact 1:1 correspondence with plate_id.
+  unique_id_cols: []
+  # Expected number of distinct values per column, e.g. {CHEMICAL_NAME: 123}.
+  expected_n_distinct: {}
+
+# Human decision after the first render (status: needs_review).
+# Each entry needs a plate_id and a reason, e.g.
+#   - plate_id: "PE-4551"
+#     reason: "73 wells mislabeled PLATE_NAME; provider re-export pending"
+exclude_plates: []
+
+# ---------------------------------------------------------------------------
+# Well curation: the combined output must contain ONLY wells holding exactly
+# one larva. keep_well = FALSE then means "one larva, dead/malformed" and every
+# well in combined.rds counts toward the denominator (n per dose group).
+# Wells with NO larva, MULTIPLE larvae, or a technical failure must not be in
+# the output. All well lists below use entries of the form
+#   - plate_id: "28"
+#     well_id: "F10"
+#     reason: "2 larva (provider comment)"
+# plate_id/well_id are the values AFTER column_mapping (canonical columns).
+# ---------------------------------------------------------------------------
+
+# Where keep_well comes from.
+#   source: column  -> mapped from a provider column in column_mapping.
+#   source: derived -> provider has no usable flag; do NOT map keep_well in
+#                      column_mapping and add keep_well to optional_roles.
+#                      Wells listed in false_wells get FALSE, all others TRUE.
+keep_well:
+  source: column
+  false_wells: []
+
+# Case "provider already removed problem wells": declare every well the
+# provider dropped (absent from the delivered file). A plate whose ONLY
+# per-plate QC failures are row/VC/dose counts, with a shortfall that matches
+# exactly these declared wells, is accepted. Undeclared shortfalls still fail.
+provider_removed_wells: []
+
+# Case "problem wells are still in the delivered data": wells to remove
+# completely from the output (no larva, multiple larvae, technical failure).
+remove_wells: []
+
+# Optional candidate finder: wells whose comment matches the pattern
+# (case-insensitive regex) are listed in the report. Each flagged well must be
+# resolved in remove_wells OR keep_flagged_wells, otherwise needs_review.
+# Matching never removes anything by itself.
+flag_comment_column: null     # e.g. COMMENTS
+flag_comment_pattern: null    # e.g. "larva|missing|empty"
+keep_flagged_wells: []        # flagged, but confirmed as exactly one larva
+
+# ---------------------------------------------------------------------------
+# Vehicle-control usability per plate (after well curation).
+# A plate with NO kept vehicle-control well is always flagged (exclusion is
+# the only option). With min_kept_vc_pct set, plates whose kept VC wells /
+# VC wells present (in %) is BELOW this value are flagged too, e.g. 75
+# (12 of 16 passes, 11 of 16 is flagged). null = only the zero check.
+# Each flagged plate must be in exclude_plates or accept_low_vc_plates.
+# ---------------------------------------------------------------------------
+min_kept_vc_pct: null
+accept_low_vc_plates: []      # [{plate_id, reason}]

@@ -1,0 +1,61 @@
+# Parameters for one interplate-vc-qc run.
+# Location: <project>/analysis/interplate-vc-qc/<run_label>/interplate-vc-qc.yml
+# Render:   quarto render interplate-vc-qc.qmd --execute-params interplate-vc-qc.yml
+#
+# Every value below is a scientific/study choice. Fill it in WITH the user;
+# never guess. Values marked REQUIRED have no default.
+
+# REQUIRED. Must equal this run folder's name (letters, digits, '-', '_').
+run_label: "CHANGE_ME"
+
+# Project root relative to this run folder (analysis/interplate-vc-qc/<run>/).
+project_root: "../../.."
+
+# REQUIRED. Exactly one dataset-import-qc run folder (relative to the project
+# root) whose manifest status is `complete`.
+upstream:
+  - analysis/dataset-import-qc/CHANGE_ME
+
+# REQUIRED. Why these plates form one comparison cohort (all plates in the
+# upstream run are compared with each other), e.g.
+# "127 plates, one lab, one assay batch".
+cohort_note: "CHANGE_ME"
+
+# REQUIRED. Assay phase windows: segment name -> inclusive time_value range
+# (same windows as the other skills). Shading only.
+segments:
+  L1: {from: 1, to: 10}
+  D1: {from: 11, to: 20}
+
+# Optional per-segment shading overrides, e.g. L1: {fill: "yellow", alpha: 0.2}
+segment_style: null
+
+# REQUIRED. Y-axis label (what response_value measures).
+response_label: "CHANGE_ME"
+
+# Plate identity in tables, hover text, and decision-page titles: these
+# columns joined with "@", e.g. [CHEMICAL_NAME, chemical_id, plate_id].
+# Must be constant within a plate. Empty = plate_id.
+title_cols: [plate_id]
+
+# Plate reference pattern: median (published method) | mean of VC wells.
+summary_type: median
+
+# Confidence level of the ellipses (published: 0.95).
+conf_level: 0.95
+
+# Method that defines "flagged" plates (both are always computed and shown):
+# ellipse_normal (published, default) | ellipse_t (robust; flags more plates).
+flag_method: ellipse_normal
+
+# Human decisions after the first render (status: needs_review). Every
+# flagged plate must be listed in exactly one of the two lists, with a reason:
+#   - plate_id: "112"
+#     reason: "VC traces normal on inspection; keep"
+# Unflagged plates may also be excluded (with a reason).
+exclude_plates: []
+keep_plates: []
+
+# QC PDF page size in inches.
+pdf_width: 15
+pdf_height: 10

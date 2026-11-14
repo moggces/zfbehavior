@@ -1,0 +1,64 @@
+# Parameters for one raw-response-plots run.
+# Location: <project>/analysis/raw-response-plots/<run_label>/raw-response-plots.yml
+# Render:   quarto render raw-response-plots.qmd --execute-params raw-response-plots.yml
+#
+# Every value below is a scientific/study choice. Fill it in WITH the user;
+# never guess. Values marked REQUIRED have no default.
+
+# REQUIRED. Must equal this run folder's name (letters, digits, '-', '_').
+run_label: "CHANGE_ME"
+
+# Project root relative to this run folder (analysis/raw-response-plots/<run>/).
+project_root: "../../.."
+
+# REQUIRED. Exactly one dataset-import-qc run folder (relative to the project
+# root) whose manifest status is `complete`.
+upstream:
+  - analysis/dataset-import-qc/CHANGE_ME
+
+# REQUIRED. Assay phase windows: segment name -> time_value range (inclusive,
+# integer steps; same windows as the endpoint step). Used for plot shading
+# only. Never invent these. Segment names starting with "L" (light) are
+# shaded yellow by default; other segments are unshaded.
+segments:
+  L1: {from: 1, to: 10}
+  D1: {from: 11, to: 20}
+
+# Optional per-segment shading overrides, e.g.
+#   L1: {fill: "yellow", alpha: 0.2}
+#   D1: {fill: "grey", alpha: 0.1}
+segment_style: null
+
+# REQUIRED. Y-axis label (what response_value measures), e.g. "distance moved (mm)".
+response_label: "CHANGE_ME"
+
+# One panel per group. Default: one panel per plate.
+group_cols: [plate_id]
+
+# Panel title: these columns joined with "@", e.g.
+# [CHEMICAL_NAME, chemical_id, plate_id]. Must be constant within a group.
+# Empty/null = the group key.
+title_cols: []
+
+# Long panel titles wrap onto several lines at this many characters.
+title_wrap_width: 60
+
+# median (median + Q25-Q75 band) | mean (mean + 95% CI band)
+summary_type: median
+
+# impute_zero (default; matches the curves endpoints are computed from) |
+# na_omit (exploratory; gaps / NA-dropped summaries)
+missing_value_policy: impute_zero
+
+# Well-level PDF: vehicle_control (VC wells only, default) | all (every well; slow, large)
+wells: vehicle_control
+
+# Panel (page) order: alphabetical (default; case-insensitive by panel title,
+# so replicate plates of a chemical are adjacent) | group_key (by group key
+# as text, e.g. plate 1, 10, 100, ...).
+panel_order: alphabetical
+
+# PDF page size in inches (each page holds a 3 x 2 summary grid or a 2 x 2
+# well grid; see ?plot_raw_responses_pages).
+pdf_width: 15
+pdf_height: 10

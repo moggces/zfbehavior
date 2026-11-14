@@ -1,0 +1,289 @@
+---
+title: "Methods and modules"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Methods and modules}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE, comment = "#>", fig.width = 7, fig.height = 4.5,
+  out.width = "100%"
+)
+```
+
+This vignette describes the methods of the five zfbehavior modules and runs
+the main functions on the example data shipped with the package. In real
+projects these steps are run by the Agent Skills
+(`vignette("getting-started", package = "zfbehavior")`), which add the
+human decisions, reports and records; the functions are the same.
+
+```{r setup}
+library(zfbehavior)
+```
+
+## The assay and the example data
+
+In the light-dark transition test, larvae (here 120 hours post
+fertilization) in 96-well plates are tracked under alternating light and
+dark phases, and the distance moved is recorded per well and per one-minute
+bin. Each plate tests one chemical: vehicle-control (VC) wells and several
+concentrations. Larvae that are dead or malformed are not analyzed for
+behavior but count for developmental toxicity.
+
+The example data are three plates of such a study (`?zfbehavior_example`):
+50 bins with phases L1 (1-10 min), D1 (11-20), L2 (21-30) and D2 (31-50),
+16 VC wells and 5 concentrations x 16 wells per plate.
+
+```{r data}
+raw <- readRDS(system.file("extdata", "zf_behavior_example.rds", package = "zfbehavior"))
+unique(raw[, c("PLATE_NAME", "CHEMICAL_NAME")])
+```
+
+## Module 1: data import and consistency checks
+
+Skill `dataset-import-qc`; help `?module1`.
+
+**Canonical columns.** Vendor columns are mapped to fixed roles
+(`plate_id`, `well_id`, `chemical_id`, `is_vehicle_control`,
+`concentration`, `concentration_unit`, `time_value`, `response_value`,
+`keep_well`); nothing is guessed. Files are read with
+`read_behavior_data()`, which stops on any value the reader cannot parse.
+The example is already loaded, so here the columns are only renamed:
+
+```{r map}
+mapping <- c(
+  plate_id = "PLATE_NAME", well_id = "WELL_POSITION",
+  chemical_id = "BIOBIDE_ID", is_vehicle_control = "IS_VEHICLE",
+  concentration = "CONCENTRATION", concentration_unit = "CONCENTRATION_UNIT",
+  time_value = "time_end", response_value = "DISTANCE_MOVED",
+  keep_well = "KEEP_WELL_DATA"
+)
+d <- dplyr::rename(raw, !!!mapping)
+```
+
+**Consistency checks.** `validate_behavior_data()` checks types, one row
+per plate x well x time, complete time series, VC and dose-group replicate
+counts, and rows per plate, against the expected design;
+`validate_combined_dataset()` checks identifiers across plates.
+
+```{r validate}
+validate_behavior_data(d, expected_vc_wells = 16, expected_dose_wells = 16,
+                       expected_row_count = 96 * 50)
+```
+
+**Single-larva wells.** Every well must hold exactly one larva:
+`keep_well = TRUE` (analyzed) or `FALSE` (dead or malformed). Wells with no
+larva, several larvae or a technical failure must be removed, otherwise
+they are counted as affected larvae in developmental toxicity. In the
+example five such wells are still present, marked in the lab's comments:
+
+```{r curate}
+not_one_larva <- d$COMMENTS %in% c("empty", "2 larvae")
+unique(d[not_one_larva, c("plate_id", "well_id", "COMMENTS")])
+d <- d[!not_one_larva, ]
+```
+
+The skill shows such wells, records your decision, and accepts the
+resulting shorter plates. Finally, bins where tracking failed for a live
+larva count as no movement (`replace_na_response_zero()`), and only kept
+wells go on to the behavioral endpoints:
+
+```{r ready}
+d_kept <- replace_na_response_zero(d[d$keep_well, ])
+```
+
+## Module 2: raw-response visualization and inter-plate VC QC
+
+Skills `raw-response-plots`, `interplate-vc-qc`; help `?module2`.
+
+The movement of each dose group over time, here for one plate; the labels
+give kept/total wells (`count_wells_by_dose()` on the data before removing
+`keep_well = FALSE` wells). Light phases are shaded.
+
+```{r raw-plot}
+segments <- list(L1 = 1:10, D1 = 11:20, L2 = 21:30, D2 = 31:50)
+wells <- count_wells_by_dose(d, c("plate_id", "is_vehicle_control", "concentration"))
+plot_raw_responses(d_kept[d_kept$plate_id == "Plate_01", ], segments,
+                   well_counts = wells)
+```
+
+**Inter-plate VC QC** (Truong et al. 2026): each plate's VC larvae give one
+reference pattern, the median distance per minute
+(`calculate_plate_reference_pattern()`). A PCA of these patterns over all
+plates (`fit_plate_pca()`) and the 95% confidence ellipse of the first two
+components (`detect_plate_pca_outliers()`) flag plates whose controls
+behaved unlike the others; a person decides whether to exclude them. This
+needs many plates, so it is not run on the three example plates; see the
+example in `?detect_plate_pca_outliers`.
+
+## Module 3: endpoints, normalization, and intra-plate VC QC
+
+Skills `behavior-endpoints`, `intraplate-vc-qc`, `devtox-endpoints`; help
+`?module3`.
+
+**Behavioral endpoints**, per well (Hsieh et al. 2019; Truong et al.
+2026):
+
+- *Total Distance*: area under the movement curve in each phase.
+- *Distance Change* (`both`) and *Distance Shift* (`up`, `down`): area
+  between the well's curve and the plate's VC median curve in each phase;
+  absolute, above, and below the VC curve.
+- *Movement Similarity*: over the whole assay, the mean correlation
+  (Spearman by default) of the well's curve with the plate's VC wells
+  (negative values and wells without movement count as 0).
+
+**Normalization** to the plate's VC median (`denom`): Total Distance
+`(log10(x + 1) - denom) * 100` with `denom` on the log scale; Distance
+Change/Shift none (already relative to the VC curve); Movement Similarity
+`x / denom * 100 - 100`. Each row keeps the value before normalization
+(`endpoint_value_raw`, used for statistics) and after
+(`endpoint_value_norm`, used for BMC).
+
+```{r endpoints}
+e <- generate_behavior_endpoints(d_kept, auc_segments = segments,
+                                 similarity_segments = list(LD = 1:50))
+unique(e$endpoint)
+```
+
+Total Distance per plate and phase (one panel per plate, one row per
+phase). The plot needs about 2.2 inches of height per endpoint row plus 1.5
+inches for titles and axes, here 1.5 + 2.2 x 4 = 10.3 inches; the skill
+sizes its PDFs the same way.
+
+```{r dose-response, fig.width = 10, fig.height = 10.3}
+plot_behavior_dose_response_pages(
+  e[e$endpoint_type == "total_distance", ], group_cols = "plate_id",
+  endpoint_order = names(segments), ncol = 3
+)
+```
+
+**Intra-plate VC QC** (Truong et al. 2026): a plate is flagged when its VC
+median for an endpoint lies outside a Tukey fence over all plates
+(`detect_behavior_vc_baseline_outliers()`), or when its VC larvae move
+inconsistently (VC movement similarity below a threshold, 0.4 published).
+None of the three example plates is flagged:
+
+```{r intraplate}
+detect_behavior_vc_baseline_outliers(e, flagged_only = TRUE)
+```
+
+**Developmental toxicity**: per dose group, the larvae (`N`, wells present)
+and the affected larvae (`n_affected`, `keep_well = FALSE`). Here the
+removal of the five non-single-larva wells matters: `N` is 15 for the
+affected groups of Plate_62.
+
+```{r devtox}
+dt <- calculate_devtox_endpoints(d, group_cols = "plate_id")
+dt[dt$plate_id == "Plate_62", c("concentration", "N", "n_affected", "pct_affected")]
+```
+
+## Module 4: ANOVA / repeated-measures ANOVA hit calling
+
+Skill `behavior-endpoints-anova`; help `?module4`.
+
+Per plate, each treated concentration is compared with the vehicle
+control (Konrad et al. 2026). Endpoints are first transformed towards
+normality: Distance Change with log10, Movement Similarity with the Fisher
+z transform.
+
+- **ANOVA** (`run_anova()`): per plate and endpoint, one-way ANOVA with
+  Dunnett's test against the VC.
+- **Repeated-measures ANOVA** (`run_rmanova()`): per plate, Distance Change
+  over the phases, with an AR(1) correlation between the phases of each
+  larva; full model (concentration x phase) and reduced model
+  (concentration + phase), each with Dunnett's tests.
+- **Hit** (`run_anova_rmanova_hit_calling()`): a significant overall test
+  and at least one significant Dunnett comparison; for the
+  repeated-measures ANOVA the full model is checked first, the reduced
+  model second.
+
+```{r anova}
+set.seed(1)
+anova <- run_anova(e, group_cols = c("plate_id", "endpoint"),
+                   value_col = "endpoint_value_raw")
+rmanova <- run_rmanova(e, group_cols = "plate_id", phase_levels = names(segments),
+                       value_col = "endpoint_value_raw")
+hits <- run_anova_rmanova_hit_calling(
+  anova, rmanova,
+  anova_group_cols = c("plate_id", "endpoint"), rmanova_group_cols = "plate_id"
+)
+table(hits$test, hits$decision_state)
+```
+
+The three example chemicals are not active by these tests.
+`plot_behavior_anova_activity_pages()` draws the hits of many chemicals in
+one overview.
+
+## Module 5: Curvep-based BMC modeling
+
+Skills `behavior-endpoints-bmc`, `devtox-endpoints-bmc`; help `?module5`.
+
+Curvep (package Rcurvep) fits each concentration-response curve without a
+model shape, and bootstrapping the wells gives a hit confidence (the
+fraction of bootstrap curves that are active) and a BMC with confidence
+interval (Hsieh et al. 2019). The benchmark response (BMR) is the response
+below which an effect is treated as noise:
+
+- from the VC variability, median + 3 MAD of the VC values
+  (`estimate_bmr_from_control()`; default for Distance Change/Shift);
+- suggested by Rcurvep's knee-point method and reviewed by a person
+  (`estimate_bmr_curvep()`; default for Total Distance and Movement
+  Similarity);
+- or a known value (default for percent affected).
+
+Each BMR comes with a direction (`RNGE`: positive for an increase,
+negative for a decrease). Curvep uses treated concentrations on the log10
+molar scale.
+
+```{r bmc}
+dc <- e[e$endpoint_type == "distance_change_shift" & e$component == "both", ]
+bmr <- estimate_bmr_from_control(dc, group_cols = "endpoint",
+                                 value_col = "endpoint_value_norm")
+bmr$RNGE <- 1e6
+bmr
+
+treated <- dc[!dc$is_vehicle_control, ]
+treated$conc <- log10(treated$concentration / 1e6)
+treated$chemical <- treated$plate_id
+fit <- run_bmc_curvep(treated, bmr, value_col = "endpoint_value_norm",
+                      n_samples = 50, seed = 1)
+fit$act_summary[, c("chemical", "endpoint", "hit_confidence", "POD_med")]
+```
+
+`POD_med` is the log10 molar BMC; with a hit confidence of 0.5 or less, no
+curve here is a hit. The skills use 1000 bootstrap samples (`n_samples`);
+50 keeps this example fast.
+
+## Validation
+
+The functions were compared with the original analysis scripts on the
+test data shipped with the package (the regression tests), and the skills
+were run on one complete real batch and compared with the results of the
+original analysis pipeline.
+
+## Limitations and planned work
+
+- The repeated-measures ANOVA is being reviewed against the original
+  method.
+- Power calculation for study design (Konrad et al. 2026) is planned.
+- A BMR for Distance Change/Shift calibrated on VC-only curves is planned.
+- The BMC of Total Distance has not yet been checked on a full real batch.
+
+## References
+
+- Hsieh J-H, Ryan K, Sedykh A, Lin J-A, Shapiro AJ, Parham F, Behl M
+  (2019). Application of benchmark concentration (BMC) analysis on
+  zebrafish data: a new perspective for quantifying toxicity in
+  alternative animal models. *Toxicological Sciences* 167(1):92-104.
+  <https://doi.org/10.1093/toxsci/kfy258>
+- Konrad KS, Allen-Moyer K, Ellis L, et al. (2026). Power calculations for
+  larval zebrafish in light-dark transition test for developmental
+  neurotoxicity. *NeuroToxicology* 112:103371.
+  <https://doi.org/10.1016/j.neuro.2025.103371>
+- Truong L, Hsieh J-H, Ellis L, et al. (2026). Zebrafish behavioral
+  assessment as a first-tier whole-organism NAM for developmental
+  neurotoxicity: a multi-laboratory evaluation. *NeuroToxicology*
+  116:103504. <https://doi.org/10.1016/j.neuro.2026.103504>

@@ -1,0 +1,195 @@
+---
+title: "Getting started with the agent skills"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Getting started with the agent skills}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(collapse = TRUE, comment = "#>", eval = FALSE)
+```
+
+zfbehavior analyzes zebrafish larval light-dark transition test (LDTT)
+data and developmental toxicity, from the vendor's tracking files to hit
+calls and benchmark concentrations (BMC). It comes with **Agent Skills**:
+step-by-step guides that a coding agent (or a person) follows to run one
+analysis step, ask you for every scientific choice, and render a report.
+This vignette explains how to use them. The methods behind each step are in
+`vignette("methods", package = "zfbehavior")`.
+
+## Modules and skills
+
+The workflow has five modules. A module is a method step; a skill is what
+you run. Each skill run gets its own folder with a report and outputs.
+
+| # | Module | Skills |
+|---|---|---|
+| 1 | Data import and consistency checks | `dataset-import-qc` |
+| 2 | Raw-response visualization and inter-plate VC QC | `raw-response-plots`, `interplate-vc-qc` |
+| 3 | Endpoint calculation, normalization, and intra-plate VC QC | `behavior-endpoints`, `intraplate-vc-qc`, `devtox-endpoints` |
+| 4 | ANOVA/repeated-measures ANOVA hit calling | `behavior-endpoints-anova` |
+| 5 | Curvep-based BMC modeling of behavioral and developmental toxicity endpoints | `behavior-endpoints-bmc`, `devtox-endpoints-bmc` |
+
+A skill reads the outputs of the skills before it (VC = vehicle control;
+`[QC]` runs are optional and only list plates to exclude):
+
+```text
+dataset-import-qc  (M1)
+ |-- raw-response-plots  (M2)
+ |-- [QC] interplate-vc-qc  (M2)
+ |-- behavior-endpoints  (M3)
+ |    |-- [QC] intraplate-vc-qc  (M3)
+ |    |-- behavior-endpoints-anova  (M4)
+ |    `-- behavior-endpoints-bmc  (M5)
+ `-- devtox-endpoints  (M3)
+      `-- devtox-endpoints-bmc  (M5)
+```
+
+A usual behavior run: `dataset-import-qc` -> `raw-response-plots` ->
+`interplate-vc-qc` -> `behavior-endpoints` -> `intraplate-vc-qc` ->
+`behavior-endpoints-anova` and/or `behavior-endpoints-bmc`. The
+developmental toxicity branch is `devtox-endpoints` ->
+`devtox-endpoints-bmc`.
+
+## Setup
+
+You need R (>= 4.1), [Quarto](https://quarto.org) (the skills render
+Quarto reports), and the package with its dependencies, including Rcurvep:
+
+```{r}
+# install.packages("remotes")
+remotes::install_github("moggces/zfbehavior")
+```
+
+The skills are installed with the package. Find them with:
+
+```{r}
+system.file("skills", package = "zfbehavior")
+#> .../zfbehavior/skills
+#>   CONVENTIONS.md
+#>   dataset-import-qc/SKILL.md, templates/
+#>   raw-response-plots/SKILL.md, templates/
+#>   ...
+```
+
+Each skill folder has a `SKILL.md` (the guide) and `templates/` (a Quarto
+report `.qmd` and its parameter file `.yml`). `CONVENTIONS.md` holds the
+rules shared by all skills.
+
+## Giving the skills to an agent
+
+Any coding agent that can read files and run a shell can use the skills.
+Two ways:
+
+1. **Point the agent at the file.** In your prompt, give the path of the
+   `SKILL.md`, e.g. "Read
+   `<path from system.file()>/dataset-import-qc/SKILL.md` and
+   `CONVENTIONS.md` next to it, then import the data in `data/raw/`."
+2. **Install them as agent skills.** Agents that support the Agent Skills
+   format find skills in a fixed folder, e.g.
+   `~/.config/opencode/skills/` (opencode) or `.claude/skills/` in your
+   project (Claude Code). Copy or link the skill folders there:
+
+   ```{bash}
+   SKILLS=$(Rscript -e 'cat(system.file("skills", package = "zfbehavior"))')
+   mkdir -p ~/.config/opencode/skills
+   ln -s "$SKILLS" ~/.config/opencode/skills/zfbehavior
+   ```
+
+   A link follows package updates; a copy does not. The agent then picks a
+   skill by its description when you ask, e.g., "import the new zebrafish
+   batch".
+
+The skills call only exported zfbehavior functions, and render with the
+**installed** package, so update the package before re-running a skill
+after an update.
+
+## Project layout
+
+All results go into your analysis project, never into the package:
+
+```text
+my-project/
+|-- data/raw/260416/                       vendor files, never modified
+`-- analysis/
+    |-- dataset-import-qc/260416/          one folder per run
+    |   |-- dataset-import-qc.qmd            copied template
+    |   |-- dataset-import-qc.yml            your choices, with reasons
+    |   |-- dataset-import-qc.html           report
+    |   `-- outputs/
+    |       |-- dataset-import-qc__260416__combined.rds
+    |       `-- dataset-import-qc__260416__manifest.yml
+    `-- behavior-endpoints/260416/
+        `-- behavior-endpoints.yml           upstream: analysis/dataset-import-qc/260416
+```
+
+- **Run label.** You choose it (e.g. the batch ID, or a setting name such as
+  `bmr20`). Several runs of one skill are sibling folders; a run folder is
+  never overwritten without asking you.
+- **The yml** records every scientific choice of the run: column mapping,
+  expected counts, phase windows, BMR settings, exclusions with reasons. The
+  agent fills it in with you and never invents a setting.
+- **Rendering** is one command in the run folder:
+
+  ```{bash}
+  cd analysis/behavior-endpoints/260416
+  quarto render behavior-endpoints.qmd --execute-params behavior-endpoints.yml
+  ```
+
+- **The manifest** (`outputs/*__manifest.yml`) records the status, the
+  parameters, the package version, and every input and output with its md5
+  checksum. Status is `complete` (safe to use downstream), `needs_review`
+  (stopped for your decision; downstream outputs not written) or `failed`.
+- **Upstream.** A run lists the run folders it reads under `upstream:`. A
+  skill refuses to start if an upstream run is not `complete`, and warns if
+  an upstream output changed after it was written.
+
+## Decisions you make
+
+The skills stop and ask whenever a choice is scientific. The main ones:
+
+| Skill | You decide |
+|---|---|
+| `dataset-import-qc` | column mapping and types; expected wells and timepoints; which wells to remove (no larva, several larvae, technical failure); plates to exclude |
+| `interplate-vc-qc`, `intraplate-vc-qc` | keep or exclude each flagged plate, with a reason |
+| `behavior-endpoints` | phase windows (e.g. L1 1-10, D1 11-20, ...); similarity window and metric; plot layout |
+| `behavior-endpoints-anova` | significance level; similarity metrics |
+| `behavior-endpoints-bmc`, `devtox-endpoints-bmc` | BMR per endpoint type and how it is chosen; direction; per-plate or pooled fitting |
+
+The QC skills do not change the data: they write a list of excluded plates
+in their manifest, and the later skills drop those plates when you list the
+QC run under `upstream:`.
+
+**Single-larva wells.** After `dataset-import-qc`, every well holds exactly
+one larva: `keep_well = TRUE` (analyzed) or `FALSE` (dead or malformed).
+Wells with no larva, several larvae or a technical failure are removed
+there and only there; later skills never change the wells. See
+`?zfbehavior::module1`.
+
+## An example session
+
+> **You:** Import the plates in `data/raw/260416/` with the
+> `dataset-import-qc` skill. Run label `260416`.
+>
+> **Agent:** reads the skill, asks for the plate design (96 wells, 50
+> one-minute bins, 16 VC wells and 16 wells per dose) and how problem wells
+> are marked, looks at one file, proposes the column mapping and types, and
+> waits for your confirmation.
+>
+> **Agent:** creates `analysis/dataset-import-qc/260416/`, fills in the
+> yml, renders. The manifest says `needs_review`: 5 wells have the comment
+> "empty" or "2 larvae". You decide to remove them; the agent records this
+> in the yml with your reason and renders again: `complete`.
+>
+> **You:** Now plot the raw responses, then compute the behavioral
+> endpoints.
+
+## Without an agent
+
+Every skill can be run by hand: copy the two template files into a new run
+folder, fill in the yml following `SKILL.md`, and render. The package
+functions can also be used directly in R, as shown in
+`vignette("methods", package = "zfbehavior")`; the overview of each
+module is at `?zfbehavior::module1` to `?zfbehavior::module5`.

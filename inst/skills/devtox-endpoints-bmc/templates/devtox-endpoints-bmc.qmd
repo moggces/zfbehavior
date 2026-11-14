@@ -1,0 +1,529 @@
+---
+title: "devtox-endpoints-bmc"
+subtitle: "Benchmark concentration (Curvep) of the developmental toxicity endpoint, with dose-response plots"
+format:
+  html:
+    toc: true
+    code-fold: true
+    embed-resources: true
+execute:
+  warning: true
+  message: false
+params:
+  # All values come from devtox-endpoints-bmc.yml (--execute-params);
+  # defaults are null on purpose (nested-map defaults are not valid params).
+  run_label: null
+  project_root: "../../.."
+  upstream: null
+  table: null
+  bmr_source: null
+  bmr: null
+  bmr_reason: null
+  estimate_trsh_from: null
+  estimate_trsh_to: null
+  estimate_trsh_by: null
+  estimate_n_samples: null
+  rnge: null
+  n_samples: null
+  seed: null
+  workers: null
+  hit_threshold: null
+  title_cols: null
+  title_wrap_width: null
+  panel_order: null
+  nrow: null
+  ncol: null
+  pdf_width: null
+  pdf_height: null
+---
+
+<!--
+Template shipped with the zfbehavior package (inst/skills/devtox-endpoints-bmc/).
+Do not edit the analysis code below for a specific study -- put every
+study-specific choice in devtox-endpoints-bmc.yml and render with:
+
+  quarto render devtox-endpoints-bmc.qmd --execute-params devtox-endpoints-bmc.yml
+
+This document only calls exported zfbehavior functions (plus Rcurvep's own
+summary/plot methods on their results). See inst/skills/CONVENTIONS.md.
+-->
+
+```{r}
+#| label: setup
+#| include: false
+
+library(zfbehavior)
+loadNamespace("Rcurvep")  # registers plot() for Rcurvep's BMR estimate
+
+p <- params
+skill <- "devtox-endpoints-bmc"
+
+stop_param <- function(msg) {
+  stop("devtox-endpoints-bmc parameter error: ", msg, call. = FALSE)
+}
+as_chr <- function(x) if (is.null(x)) character(0) else unlist(x, use.names = FALSE)
+or_default <- function(x, default) if (is.null(x) || length(x) == 0) default else x
+is_unset <- function(x) {
+  is.null(x) || length(x) != 1 || is.na(x) || !nzchar(trimws(as.character(x))) ||
+    identical(as.character(x), "CHANGE_ME")
+}
+num <- function(x, default, what, lower = -Inf, integer = FALSE) {
+  v <- suppressWarnings(as.numeric(or_default(x, default)))
+  if (length(v) != 1 || !is.finite(v) || v < lower || (integer && v != round(v))) {
+    stop_param(paste0("`", what, "` must be ", if (integer) "an integer" else "a number",
+                      if (is.finite(lower)) paste0(" >= ", lower) else "", "."))
+  }
+  v
+}
+
+if (is.null(p$run_label) || !grepl("^[A-Za-z0-9_-]+$", p$run_label)) {
+  stop_param("`run_label` is required (letters, digits, '-', '_').")
+}
+upstream_runs <- sub("/+$", "", as_chr(p$upstream))
+if (length(upstream_runs) != 1) {
+  stop_param("`upstream` must list exactly one devtox-endpoints run.")
+}
+table_choice <- or_default(p$table, "per_plate")
+if (!table_choice %in% c("per_plate", "pooled")) stop_param("`table` must be per_plate or pooled.")
+bmr_source <- or_default(p$bmr_source, "user")
+if (!bmr_source %in% c("user", "estimate")) stop_param("`bmr_source` must be user or estimate.")
+bmr_given <- !is_unset(p$bmr)
+if (bmr_given) {
+  bmr <- num(p$bmr, NULL, "bmr", lower = 0)
+  if (bmr <= 0 || bmr >= 100) stop_param("`bmr` must be between 0 and 100 (percent affected).")
+  if (is_unset(p$bmr_reason)) stop_param("`bmr_reason` is required with `bmr` (why this BMR).")
+} else if (bmr_source == "user") {
+  stop_param("`bmr` (and `bmr_reason`) is required when `bmr_source: user`.")
+}
+trsh_seq <- seq(
+  num(p$estimate_trsh_from, 5, "estimate_trsh_from", lower = 0),
+  num(p$estimate_trsh_to, 95, "estimate_trsh_to", lower = 0),
+  by = num(p$estimate_trsh_by, 5, "estimate_trsh_by", lower = 0)
+)
+estimate_n_samples <- num(p$estimate_n_samples, 100, "estimate_n_samples", lower = 1, integer = TRUE)
+rnge <- num(p$rnge, 1000000, "rnge")
+n_samples <- num(p$n_samples, 1000, "n_samples", lower = 1, integer = TRUE)
+seed <- num(p$seed, 2022, "seed", integer = TRUE)
+workers <- num(p$workers, 1, "workers", lower = 1, integer = TRUE)
+hit_threshold <- num(p$hit_threshold, 0.5, "hit_threshold", lower = 0)
+if (hit_threshold >= 1) stop_param("`hit_threshold` must be below 1.")
+title_cols <- as_chr(p$title_cols)
+title_wrap_width <- num(p$title_wrap_width, 40, "title_wrap_width", lower = 1)
+panel_order <- or_default(p$panel_order, "alphabetical")
+if (!panel_order %in% c("alphabetical", "group_key")) {
+  stop_param("`panel_order` must be alphabetical or group_key.")
+}
+n_row <- num(p$nrow, 1, "nrow", lower = 1, integer = TRUE)
+n_col <- num(p$ncol, 5, "ncol", lower = 1, integer = TRUE)
+pdf_width <- num(p$pdf_width, 15, "pdf_width", lower = 1)
+pdf_height <- num(p$pdf_height, 5, "pdf_height", lower = 1)
+
+project_root <- normalizePath(p$project_root, mustWork = TRUE)
+out_dir <- "outputs"
+dir.create(out_dir, showWarnings = FALSE)
+out_path <- function(object, ext) {
+  file.path(out_dir, paste0(skill, "__", p$run_label, "__", object, ".", ext))
+}
+# CONVENTIONS.md section 2: every table saved to outputs/ is a tibble,
+# including tables one level inside a saved list / result object.
+save_rds <- function(x, path) {
+  as_tbl <- function(v) if (is.data.frame(v) && !inherits(v, "tbl_df")) tibble::as_tibble(v) else v
+  x <- as_tbl(x)
+  if (is.list(x) && !is.data.frame(x)) {
+    cls <- class(x)
+    x[] <- lapply(x, as_tbl)
+    class(x) <- cls
+  }
+  saveRDS(x, path)
+}
+md5 <- function(f) unname(tools::md5sum(f))
+
+# Saved Curvep runs (bmr-sweep.rds, curvep-raw.rds) are kept between
+# re-renders and reused when their key (input + settings) is unchanged.
+# Everything else from a previous pass is removed.
+reusable <- c(out_path("bmr-sweep", "rds"), out_path("curvep-raw", "rds"))
+for (f in list.files(out_dir, pattern = paste0("^", skill, "__", p$run_label, "__"), full.names = TRUE)) {
+  if (!f %in% reusable) file.remove(f)
+}
+load_if_key <- function(path, key) {
+  if (!file.exists(path)) return(NULL)
+  obj <- readRDS(path)
+  if (identical(obj$key, key)) obj else NULL
+}
+
+has_reactable <- requireNamespace("reactable", quietly = TRUE)
+show_table <- function(df, page_size = 15) {
+  if (has_reactable) {
+    reactable::reactable(df, filterable = TRUE, searchable = TRUE, sortable = TRUE,
+                         defaultPageSize = page_size, striped = TRUE, compact = TRUE)
+  } else {
+    knitr::kable(df, row.names = FALSE)
+  }
+}
+```
+
+## Run
+
+- Skill: `devtox-endpoints-bmc`
+- Run label: **`r p$run_label`**
+- Table: **`r table_choice`**; BMR source: **`r bmr_source`**`r if (bmr_given) paste0("; BMR = ", bmr, " (", p$bmr_reason, ")") else ""`
+- zfbehavior version: `r as.character(utils::packageVersion("zfbehavior"))`; Rcurvep `r as.character(utils::packageVersion("Rcurvep"))`
+- Rendered: `r format(Sys.time(), "%Y-%m-%d %H:%M:%S")`
+
+## Upstream
+
+One `complete` `devtox-endpoints` run. Its endpoint tables hold, per dose
+group, the larvae `N` and the affected larvae `n_affected` (dead or
+malformed), vehicle control included.
+
+```{r}
+#| label: upstream
+
+up_dir <- file.path(project_root, upstream_runs)
+up_manifest_file <- list.files(file.path(up_dir, "outputs"), pattern = "__manifest\\.yml$", full.names = TRUE)
+if (length(up_manifest_file) != 1) {
+  stop("devtox-endpoints-bmc: no unique manifest found in ", file.path(up_dir, "outputs"), call. = FALSE)
+}
+up <- yaml::read_yaml(up_manifest_file)
+if (!identical(up$skill, "devtox-endpoints")) {
+  stop("devtox-endpoints-bmc: upstream must be a devtox-endpoints run (found `", up$skill, "`).", call. = FALSE)
+}
+if (!identical(up$status, "complete")) {
+  stop("devtox-endpoints-bmc: upstream run `", upstream_runs, "` has status `", up$status,
+       "`, not `complete`. Resolve it first.", call. = FALSE)
+}
+up_outputs <- data.frame(
+  path = vapply(up$outputs, `[[`, "", "path"),
+  md5 = vapply(up$outputs, `[[`, "", "md5"),
+  stringsAsFactors = FALSE
+)
+object <- if (table_choice == "per_plate") "endpoints" else "endpoints-pooled"
+table_rel <- up_outputs$path[grepl(paste0("__", object, "\\.rds$"), up_outputs$path)]
+if (length(table_rel) != 1) {
+  stop_param(paste0("the upstream run has no `", object, "` table",
+                    if (table_choice == "pooled") " (it must use layout: by_chemical_pooled)" else "", "."))
+}
+table_file <- file.path(up_dir, table_rel)
+input_md5 <- md5(table_file)
+md5_drift <- !identical(input_md5, up_outputs$md5[up_outputs$path == table_rel])
+if (md5_drift) {
+  warning("Upstream ", object, ".rds md5 differs from its manifest: the upstream run was ",
+          "modified after it completed. Confirm with the user before using these results.",
+          call. = FALSE)
+}
+group_cols <- as_chr(if (table_choice == "per_plate") up$endpoint$group_cols else up$endpoint$pooled_group_cols)
+if (length(group_cols) == 0) stop("devtox-endpoints-bmc: upstream manifest lists no group columns.", call. = FALSE)
+
+knitr::kable(data.frame(
+  upstream = upstream_runs, status = up$status, table = basename(table_rel),
+  group_cols = paste(group_cols, collapse = ", "), md5_matches_manifest = !md5_drift
+), caption = "Upstream run and endpoint table.")
+```
+
+```{r}
+#| label: load
+
+endpoints <- readRDS(table_file)
+missing_cols <- setdiff(c(group_cols, title_cols, "is_vehicle_control", "concentration", "N", "n_affected", "endpoint"),
+                        names(endpoints))
+if (length(missing_cols) > 0) {
+  stop_param(paste0("column(s) not in the endpoint table: ", paste(missing_cols, collapse = ", ")))
+}
+has_unit <- "concentration_unit" %in% names(endpoints)
+endpoints$curve_id <- do.call(paste, c(lapply(group_cols, function(cc) as.character(endpoints[[cc]])), sep = "@"))
+
+# Curvep input: treated dose groups only; concentration as
+# log10(concentration / 1e6) (log10 molar for uM; same formula for ug/mL).
+curvep_in <- endpoints[!endpoints$is_vehicle_control, , drop = FALSE]
+curvep_in$log_conc <- log10(curvep_in$concentration / 1e6)
+if (any(!is.finite(curvep_in$log_conc))) {
+  stop("devtox-endpoints-bmc: non-positive concentration in a treated dose group.", call. = FALSE)
+}
+units <- if (has_unit) sort(unique(curvep_in$concentration_unit)) else character(0)
+
+knitr::kable(data.frame(
+  curves = length(unique(curvep_in$curve_id)),
+  treated_dose_groups = nrow(curvep_in),
+  concentration_units = if (has_unit) paste(units, collapse = ", ") else "(none)",
+  log_scale = "log10(concentration / 1e6)"
+), caption = "Curvep input (vehicle-control rows removed).")
+```
+
+## BMR
+
+```{r}
+#| label: bmr-estimate
+
+sweep_key <- list(
+  input_md5 = input_md5, table = table_choice, trsh_seq = trsh_seq, rnge = rnge,
+  n_samples = estimate_n_samples, seed = seed
+)
+sweep_status <- "not run"
+bmr_est <- NULL
+if (bmr_source == "estimate") {
+  saved <- load_if_key(out_path("bmr-sweep", "rds"), sweep_key)
+  if (!is.null(saved)) {
+    sweep <- saved$sweep
+    sweep_status <- "reused"
+    bmr_est <- Rcurvep::estimate_dataset_bmr(sweep, plot = FALSE)
+  } else {
+    if (workers > 1 && requireNamespace("future", quietly = TRUE)) {
+      old_plan <- future::plan(future::multisession, workers = workers)
+    }
+    est <- estimate_bmr_curvep(
+      curvep_in, conc_col = "log_conc", rnge = rnge, n_samples = estimate_n_samples,
+      chemical_col = "curve_id", n_in_col = "n_affected", n_col = "N",
+      trsh_seq = trsh_seq, seed = seed
+    )
+    if (workers > 1 && exists("old_plan")) future::plan(old_plan)
+    sweep <- est$sweep
+    bmr_est <- est$estimate
+    sweep_status <- "computed"
+    save_rds(list(key = sweep_key, sweep = sweep), out_path("bmr-sweep", "rds"))
+  }
+  save_rds(bmr_est, out_path("bmr-estimate", "rds"))
+  knitr::kable(bmr_est$outcome, caption = paste0(
+    "Knee-point BMR estimate (Rcurvep::estimate_dataset_bmr; TRSH ",
+    min(trsh_seq), "-", max(trsh_seq), " by ", diff(trsh_seq)[1], ", ",
+    estimate_n_samples, " samples; sweep ", sweep_status, ")."
+  ))
+} else {
+  cat("BMR source: user. No BMR estimate was run.\n")
+}
+```
+
+```{r}
+#| label: fig-bmr-estimate
+#| fig-cap: "Knee-point BMR estimate: pooled variance of POD across TRSH values."
+#| fig-width: 8
+#| fig-height: 5
+
+if (!is.null(bmr_est)) {
+  bmr_plot <- plot(bmr_est)
+  print(bmr_plot)
+  grDevices::pdf(out_path("bmr-estimate", "pdf"), width = 8, height = 5)
+  print(bmr_plot)
+  invisible(grDevices::dev.off())
+}
+```
+
+```{r}
+#| label: bmr-decision
+
+if (bmr_given) {
+  knitr::kable(data.frame(bmr = bmr, reason = p$bmr_reason, source = bmr_source,
+                          knee_point_bmr_exp = if (is.null(bmr_est)) NA else bmr_est$outcome$bmr_exp,
+                          rnge = rnge), caption = "BMR used for the BMC.")
+} else {
+  cat("No BMR chosen yet: review the estimate above, then set `bmr` and `bmr_reason`",
+      "in the yml and re-render (the saved sweep is reused).\n")
+}
+```
+
+## BMC
+
+```{r}
+#| label: bmc
+
+bmc_key <- list(input_md5 = input_md5, table = table_choice, bmr = if (bmr_given) bmr else NULL,
+                rnge = rnge, n_samples = n_samples, seed = seed)
+bmc_status <- "not run"
+results <- NULL
+if (bmr_given) {
+  saved <- load_if_key(out_path("curvep-raw", "rds"), bmc_key)
+  if (!is.null(saved)) {
+    bmc <- saved$bmc
+    bmc_status <- "reused"
+  } else {
+    if (workers > 1 && requireNamespace("future", quietly = TRUE)) {
+      old_plan <- future::plan(future::multisession, workers = workers)
+    }
+    t0 <- Sys.time()
+    bmc <- run_bmc_curvep(
+      curvep_in,
+      tibble::tibble(endpoint = "percent of affected", bmr = bmr, RNGE = rnge),
+      chemical_col = "curve_id", conc_col = "log_conc",
+      n_in_col = "n_affected", n_col = "N",
+      n_samples = n_samples, seed = seed
+    )
+    if (workers > 1 && exists("old_plan")) future::plan(old_plan)
+    bmc_status <- paste0("computed (", round(as.numeric(difftime(Sys.time(), t0, units = "mins")), 1), " min)")
+    save_rds(list(key = bmc_key, bmc = bmc), out_path("curvep-raw", "rds"))
+  }
+
+  ids <- unique(as.data.frame(endpoints)[, unique(c("curve_id", group_cols, title_cols,
+                                                     if (has_unit) "concentration_unit")), drop = FALSE])
+  ids <- ids[!duplicated(ids$curve_id), , drop = FALSE]
+  if (has_unit) {
+    # The VC row may carry another unit; take the treated unit per curve.
+    tu <- unique(as.data.frame(curvep_in)[, c("curve_id", "concentration_unit")])
+    ids$concentration_unit <- tu$concentration_unit[match(ids$curve_id, tu$curve_id)]
+  }
+  act <- as.data.frame(bmc$act_summary)
+  names(act)[names(act) == "chemical"] <- "curve_id"
+  act[] <- lapply(act, function(v) if (is.numeric(v)) unname(v) else v)  # drop "2.5%" names
+  results <- merge(ids, act, by = "curve_id", sort = FALSE)
+  results$hit <- results$hit_confidence > hit_threshold
+  # Back-transform: 10^POD * 1e6 = the dose group's own unit (uM or ug/mL).
+  results$BMC <- 10^results$POD_med * 1e6
+  results$BMCL <- 10^results$POD_cil * 1e6
+  results$BMCU <- 10^results$POD_ciu * 1e6
+  results <- results[order(-results$hit_confidence, results$curve_id), , drop = FALSE]
+  rownames(results) <- NULL
+
+  knitr::kable(data.frame(
+    curves = nrow(results),
+    hits = sum(results$hit),
+    hit_threshold = hit_threshold,
+    bmr = bmr,
+    n_samples = n_samples,
+    seed = seed,
+    curvep = bmc_status
+  ), caption = "BMC summary (hit = hit_confidence > hit_threshold).")
+} else {
+  cat("BMC not calculated: no BMR chosen yet.\n")
+}
+```
+
+```{r}
+#| label: tbl-hits
+
+if (!is.null(results)) {
+  show_cols <- unique(c(setdiff(names(ids), "curve_id"), "hit_confidence", "hit", "BMC", "BMCL", "BMCU",
+                        "POD_med", "n_conc", "max_resp_med"))
+  tbl <- results[, intersect(show_cols, names(results)), drop = FALSE]
+  for (cc in c("BMC", "BMCL", "BMCU")) tbl[[cc]] <- signif(tbl[[cc]], 3)
+  tbl$POD_med <- round(tbl$POD_med, 3)
+  show_table(tbl)
+}
+```
+
+## Dose-response plots with BMC
+
+`plot_devtox_dose_response_pages()`: percent affected per dose group
+(vehicle control `VC`), labeled with BMC and score for hits only.
+
+```{r}
+#| label: plots
+
+n_pages <- 0L
+pdf_file <- out_path("dose-response-bmc", "pdf")
+if (!is.null(results)) {
+  plot_data <- endpoints
+  tcols <- if (length(title_cols) > 0) title_cols else "curve_id"
+  plot_data$plot_title <- do.call(paste, c(lapply(tcols, function(cc) as.character(plot_data[[cc]])), sep = " | "))
+  titles <- unique(as.data.frame(plot_data)[, c("curve_id", "plot_title")])
+  if (anyDuplicated(titles$curve_id)) stop_param("`title_cols` must be constant within each curve.")
+  key_levels <- if (panel_order == "alphabetical") {
+    titles$curve_id[order(tolower(titles$plot_title), titles$plot_title, method = "radix")]
+  } else {
+    sort(titles$curve_id)
+  }
+  plot_data$panel_key <- factor(plot_data$curve_id, levels = key_levels)
+  bmc_plot <- data.frame(
+    panel_key = results$curve_id,
+    BMC = ifelse(results$hit, results$BMC, NA_real_),
+    BMCL = ifelse(results$hit, results$BMCL, NA_real_),
+    score = results$hit_confidence
+  )
+  pages <- plot_devtox_dose_response_pages(
+    plot_data, group_cols = "panel_key", bmc_data = bmc_plot,
+    title_col = "plot_title", title_wrap_width = title_wrap_width,
+    nrow = n_row, ncol = n_col
+  )
+  grDevices::pdf(pdf_file, width = pdf_width, height = pdf_height)
+  for (pg in pages) {
+    grid::grid.newpage()
+    grid::grid.draw(pg)
+  }
+  invisible(grDevices::dev.off())
+  n_pages <- length(pages)
+  knitr::kable(data.frame(pdf = pdf_file, panels = length(key_levels), pages = n_pages),
+               caption = "Dose-response PDF with BMC labels written.")
+}
+```
+
+```{r}
+#| label: fig-first-page
+#| fig-cap: "First page of the dose-response PDF (BMC labels on hits)."
+#| fig-width: !expr pdf_width
+#| fig-height: !expr pdf_height
+
+if (n_pages > 0) {
+  grid::grid.newpage()
+  grid::grid.draw(pages[[1]])
+}
+```
+
+## Status and outputs
+
+```{r}
+#| label: save
+
+if (!bmr_given) {
+  status <- "needs_review"
+  status_reason <- paste0(
+    "BMR estimate done (knee-point bmr_exp = ", paste(bmr_est$outcome$bmr_exp, collapse = ", "),
+    "). Review it, then set `bmr` and `bmr_reason` in the yml and re-render."
+  )
+} else {
+  status <- "complete"
+  status_reason <- paste0(nrow(results), " curve(s), ", sum(results$hit), " hit(s) at BMR ", bmr,
+                          ". Inspect the dose-response PDF.")
+}
+
+outputs <- character(0)
+if (bmr_source == "estimate") {
+  outputs <- c(outputs, out_path("bmr-sweep", "rds"), out_path("bmr-estimate", "rds"),
+               out_path("bmr-estimate", "pdf"))
+}
+if (bmr_given) {
+  save_rds(results, out_path("bmc-results", "rds"))
+  outputs <- c(outputs, out_path("curvep-raw", "rds"), out_path("bmc-results", "rds"), pdf_file)
+}
+
+manifest <- list(
+  skill = skill,
+  run_label = p$run_label,
+  status = status,
+  status_reason = status_reason,
+  rendered_at = format(Sys.time(), "%Y-%m-%dT%H:%M:%S"),
+  zfbehavior_version = as.character(utils::packageVersion("zfbehavior")),
+  rcurvep_version = as.character(utils::packageVersion("Rcurvep")),
+  upstream = list(list(
+    run = upstream_runs, skill = up$skill,
+    manifest = file.path(upstream_runs, "outputs", basename(up_manifest_file)), status = up$status
+  )),
+  inputs = list(list(path = file.path(upstream_runs, table_rel), md5 = input_md5,
+                     md5_matches_upstream_manifest = !md5_drift)),
+  outputs = lapply(outputs, function(f) list(path = f, md5 = md5(f))),
+  method = list(
+    table = table_choice,
+    curve_key = paste(group_cols, collapse = "@"),
+    conc_transform = "log10(concentration / 1e6); BMC = 10^POD * 1e6 in the dose group's unit",
+    concentration_units = as.list(units),
+    bmr_source = bmr_source,
+    bmr = if (bmr_given) bmr else NULL,
+    bmr_reason = if (bmr_given) p$bmr_reason else NULL,
+    knee_point_bmr_exp = if (is.null(bmr_est)) NULL else bmr_est$outcome$bmr_exp,
+    rnge = rnge, n_samples = n_samples, seed = seed, hit_threshold = hit_threshold
+  ),
+  curvep_runs = list(bmr_sweep = sweep_status, bmc = bmc_status),
+  summary = list(
+    n_curves = length(unique(curvep_in$curve_id)),
+    n_hits = if (is.null(results)) NULL else sum(results$hit),
+    n_pdf_pages = n_pages
+  ),
+  parameters = p
+)
+yaml::write_yaml(manifest, out_path("manifest", "yml"))
+```
+
+**Status: `r status`.** `r status_reason`
+
+```{r}
+#| label: outputs
+
+knitr::kable(data.frame(output = c(outputs, out_path("manifest", "yml"))),
+             caption = "Files written by this run.")
+```
