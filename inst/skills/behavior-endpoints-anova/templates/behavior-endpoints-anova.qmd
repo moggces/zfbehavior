@@ -127,6 +127,22 @@ save_rds <- function(x, path) {
   saveRDS(x, path)
 }
 md5 <- function(f) unname(tools::md5sum(f))
+# cairo_pdf renders non-ASCII names and arrows, but on macOS without
+# XQuartz it can be reported as available yet write no file: use it only if
+# a test file can really be written, otherwise grDevices::pdf.
+pdf_device <- local({
+  ok <- FALSE
+  if (capabilities("cairo")) {
+    f <- tempfile(fileext = ".pdf")
+    ok <- tryCatch({
+      suppressWarnings(grDevices::cairo_pdf(f))
+      grDevices::dev.off()
+      file.exists(f)
+    }, error = function(e) FALSE)
+    unlink(f)
+  }
+  if (ok) grDevices::cairo_pdf else grDevices::pdf
+})
 
 has_reactable <- requireNamespace("reactable", quietly = TRUE)
 show_table <- function(df, page_size = 15) {
@@ -481,8 +497,7 @@ pages <- plot_behavior_anova_activity_pages(
 label_fit <- attr(pages, "label_fit")
 n_label_overflow <- sum(!label_fit$fits)
 activity_pdf <- out_path("activity", "pdf")
-# cairo_pdf renders non-ASCII chemical names (e.g. Greek letters).
-dev_fun <- if (capabilities("cairo")) grDevices::cairo_pdf else grDevices::pdf
+dev_fun <- pdf_device
 dev_fun(activity_pdf, width = pdf_width, height = pdf_height, onefile = TRUE)
 for (pg in pages) {
   grid::grid.newpage()

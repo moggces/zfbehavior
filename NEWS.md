@@ -13,3 +13,5 @@ First public release.
 * Example data `zf_behavior_example.rds` (3 plates) in `inst/extdata`.
 * Vignettes "Getting started with the agent skills" and "Methods and
   modules".
+* The ANOVA and BMC skills fall back to `grDevices::pdf()` when
+  `cairo_pdf()` cannot write a file (macOS without XQuartz).

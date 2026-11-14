@@ -412,7 +412,9 @@ render_skill <- function(project, skill, run, yml) {
   )))
   status <- attr(res, "status")
   if (!is.null(status) && status != 0) {
-    stop("quarto render failed:\n", paste(utils::tail(res, 30), collapse = "\n"))
+    err <- grep("^(Error|Quitting)", res)
+    show <- if (length(err) > 0) res[seq(err[1], min(length(res), err[1] + 15))] else utils::tail(res, 30)
+    stop("quarto render failed:\n", paste(show, collapse = "\n"))
   }
   out <- file.path(run_dir, "outputs")
   list(
